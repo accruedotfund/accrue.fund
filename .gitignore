@@ -15,3 +15,4 @@ ios/App/App/public/
 tsconfig.tsbuildinfo
 .DS_Store
 android/capacitor-cordova-android-plugins/
+.vercel
