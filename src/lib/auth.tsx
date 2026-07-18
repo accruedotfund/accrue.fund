@@ -31,6 +31,15 @@ if (!PRIVY_APP_ID || !PRIVY_CLIENT_ID) {
   console.error(
     '[accrue.fund] Set VITE_PRIVY_APP_ID and VITE_PRIVY_CLIENT_ID (new Accrue Privy app — not shared with any other product).',
   )
+} else if (
+  !PRIVY_CLIENT_ID.startsWith('client-') &&
+  !PRIVY_CLIENT_ID.startsWith('cl')
+) {
+  // Mobile client IDs from Privy are usually `client-…`. App secrets / other
+  // tokens will fail login with opaque errors — warn early.
+  console.warn(
+    '[accrue.fund] VITE_PRIVY_CLIENT_ID does not look like a mobile client id (expected client-…). Check Privy → App → Clients.',
+  )
 }
 
 const robinhoodChain = defineChain({
