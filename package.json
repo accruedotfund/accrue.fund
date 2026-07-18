@@ -7,7 +7,7 @@
   "homepage": "https://accrue.fund",
   "repository": {
     "type": "git",
-    "url": "https://github.com/magicalinternetdotmoney/accrue.fund.git"
+    "url": "https://github.com/accruedotfund/accrue.fund.git"
   },
   "scripts": {
     "dev": "bunx --bun vite",
