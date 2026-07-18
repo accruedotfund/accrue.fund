@@ -65,8 +65,9 @@ EUR / GBP / gold: **Coming soon** until those assets exist on Robinhood Chain.
 | **Bundle ID** | `fund.accrue` |
 | **Deep link** | `accrue://auth` |
 | **Stack** | Vite · React · Capacitor 6 · Privy · viem |
-| **Deploy** | **Vercel** (not Fly) — domain already on Vercel DNS |
+| **Deploy** | Clean hosting under Accrue identity only (see below) |
 | **Repo** | https://github.com/accruedotfund/accrue.fund |
+| **Git author** | `accruedotfund` · `accruedotfund@users.noreply.github.com` |
 
 ---
 
@@ -154,22 +155,62 @@ VITE_RH_RPC=https://robinhood-rpc.publicnode.com
 
 ---
 
-## Deploy (Vercel — not Fly)
+## Deploy & ownership (no stacc / jarett)
 
-`accrue.fund` is registered on **Vercel DNS** with an issued certificate for
-`accrue.fund` + `*.accrue.fund`.
+**Product identity**
+
+| Layer | Owner |
+|-------|--------|
+| GitHub | **`accruedotfund/accrue.fund`** only |
+| Git commits | **`accruedotfund@users.noreply.github.com`** (not a personal email) |
+| Privy | Dedicated Accrue app only |
+| Bundle | `fund.accrue` |
+
+**Do not** use stacc / jarett GitHub, Vercel, or Fly accounts for this product.
+
+### Why deploys were blocked
+
+Vercel was temporarily on a **different** (personal) team than the GitHub
+repo. That team enforces “commit email must match a GitHub account **on that
+Vercel ↔ GitHub link**.” Commits from `accruedotfund` will **always** fail
+there — and putting jarett’s email on Accrue commits is the wrong fix.
+
+### Clean cut (do this once)
+
+1. **Create a Vercel account** with an email you only use for Accrue (or sign
+   up with GitHub as **`accruedotfund`**).
+2. In that account: **Add New Project** → import `accruedotfund/accrue.fund`.
+3. **Transfer the domain** `accrue.fund` from the old Vercel team → new team  
+   (Domains → accrue.fund → Transfer), **or** transfer the registrar out and
+   point NS to the new team.
+4. Project env (Production):
+   - `VITE_PRIVY_APP_ID`
+   - `VITE_PRIVY_CLIENT_ID` (`client-…` only)
+   - `VITE_API_BASE=https://accrue.fund`
+   - chain defaults from `.env.example`
+5. Deploy → certs for `accrue.fund` issue on the **new** team automatically.
+6. Turn **off** Deployment Protection / SSO if the site must be public.
+7. Delete the old personal-team project so nothing Accrue remains there.
+
+### Local git (this machine)
 
 ```sh
-# from repo root (logged into the Vercel account that owns the domain)
-npx vercel deploy --prod --yes
-# alias is already https://accrue.fund → production deployment
+cd ~/claude/accrue.fund
+git config user.name  "accruedotfund"
+git config user.email "accruedotfund@users.noreply.github.com"
+# optional: also set as your GH primary noreply under
+# GitHub → Settings → Emails → “Keep my email addresses private”
 ```
 
-Fly.io is available on other accounts for other apps; **this product ships on
-Vercel** so certs and DNS stay in one place.
+**Do not** `git config --global` to a stacc/jarett address for this repo.
 
-If the site redirects to Vercel SSO, turn off **Deployment Protection** for
-production on the `accrue.fund` project (Settings → Deployment Protection).
+### CLI deploy (only after logged into the *Accrue* Vercel account)
+
+```sh
+npx vercel login          # use Accrue identity, not personal stacc
+npx vercel link           # link to Accrue-team project
+npx vercel deploy --prod --yes
+```
 
 ---
 
