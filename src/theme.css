@@ -1,0 +1,609 @@
+/* Accrue (accrue.fund) design system.
+   Emotion: trust + calm — a savings ledger, not a trading terminal.
+   Palette in oklch: cream paper (60), deep bank-green ink (30), one warm
+   gold accent (10, rare). Neutrals are tinted toward the brand hue (H≈150)
+   so nothing reads as flat grey; chroma is clamped at lightness extremes. */
+
+:root {
+  --paper: oklch(0.97 0.012 100);
+  --paper-raised: oklch(0.99 0.006 100);
+  --paper-sunken: oklch(0.945 0.015 105);
+  --ink: oklch(0.24 0.028 160);
+  --ink-soft: oklch(0.46 0.022 158);
+  --ink-faint: oklch(0.62 0.016 150);
+  --line: oklch(0.885 0.014 110);
+  --brand: oklch(0.37 0.068 160);
+  --brand-strong: oklch(0.29 0.058 162);
+  --brand-tint: oklch(0.93 0.024 155);
+  --gold: oklch(0.7 0.105 84);
+  --gold-deep: oklch(0.55 0.095 80);
+  --up: oklch(0.52 0.11 155);
+  --down: oklch(0.5 0.14 28);
+  --focus: oklch(0.55 0.1 160);
+
+  --serif: 'Iowan Old Style', 'Palatino Nova', Palatino, Georgia, serif;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+
+  --dur: 180ms;
+  --ease: cubic-bezier(0.3, 0, 0.2, 1);
+
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: oklch(0.21 0.02 165);
+    --paper-raised: oklch(0.25 0.022 163);
+    --paper-sunken: oklch(0.18 0.018 165);
+    --ink: oklch(0.93 0.012 100);
+    --ink-soft: oklch(0.72 0.018 130);
+    --ink-faint: oklch(0.55 0.018 145);
+    --line: oklch(0.32 0.022 160);
+    --brand: oklch(0.78 0.06 155);
+    --brand-strong: oklch(0.86 0.05 150);
+    --brand-tint: oklch(0.29 0.035 160);
+    --gold: oklch(0.75 0.1 85);
+    --gold-deep: oklch(0.68 0.1 82);
+    --up: oklch(0.72 0.11 152);
+    --down: oklch(0.68 0.13 28);
+    --focus: oklch(0.72 0.09 155);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+}
+
+/* ---- type scale (1.25 ratio off 16px; numerals set in the serif) ---- */
+
+.display {
+  font-family: var(--serif);
+  font-size: 2.6rem;
+  line-height: 1.05;
+  letter-spacing: -0.015em;
+  font-variant-numeric: lining-nums tabular-nums;
+  font-weight: 500;
+}
+
+.figure {
+  font-family: var(--serif);
+  font-variant-numeric: lining-nums tabular-nums;
+  font-weight: 500;
+}
+
+h1 {
+  font-family: var(--serif);
+  font-size: 1.55rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+h2 {
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--ink-faint);
+  margin: 0;
+}
+
+.back {
+  appearance: none;
+  border: 0;
+  background: none;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 1.35rem;
+  line-height: 1;
+  padding: 0 14px 12px 0;
+  cursor: pointer;
+}
+
+p {
+  margin: 0;
+}
+
+.muted {
+  color: var(--ink-soft);
+}
+
+.small {
+  font-size: 0.82rem;
+}
+
+/* ---- app frame ---- */
+
+.frame {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  max-width: 480px;
+  margin: 0 auto;
+}
+
+.screen {
+  flex: 1;
+  overflow-y: auto;
+  padding: calc(var(--safe-top) + 20px) 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  animation: screen-in var(--dur) var(--ease);
+}
+
+@keyframes screen-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---- tab bar ---- */
+
+.tabbar {
+  display: flex;
+  border-top: 1px solid var(--line);
+  background: var(--paper-raised);
+  padding-bottom: var(--safe-bottom);
+}
+
+.tabbar button {
+  flex: 1;
+  appearance: none;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--ink-faint);
+  padding: 10px 4px 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  transition: color var(--dur) var(--ease);
+}
+
+.tabbar button[aria-current='true'] {
+  color: var(--brand);
+}
+
+.tabbar button:active {
+  transform: translateY(1px);
+}
+
+.tabbar .glyph {
+  font-family: var(--serif);
+  font-size: 1.15rem;
+  line-height: 1;
+}
+
+/* ---- rows (Monitor pattern: ledger rows, not cards) ---- */
+
+.ledger {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+}
+
+.row {
+  appearance: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 15px 2px;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease);
+}
+
+.row:hover {
+  background: var(--paper-sunken);
+}
+
+.row:active {
+  background: var(--brand-tint);
+}
+
+.row:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.row .grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 3px;
+  background: var(--paper-sunken);
+  color: var(--ink-faint);
+  border: 1px solid var(--line);
+}
+
+.badge.boost {
+  background: var(--brand-tint);
+  color: var(--brand-strong);
+  border-color: transparent;
+}
+
+.badge.gold {
+  color: var(--gold-deep);
+  border-color: var(--gold);
+  background: none;
+}
+
+/* ---- buttons ---- */
+
+.btn {
+  appearance: none;
+  font: inherit;
+  font-weight: 600;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 14px 18px;
+  cursor: pointer;
+  transition:
+    background var(--dur) var(--ease),
+    transform 90ms var(--ease),
+    opacity var(--dur) var(--ease);
+}
+
+.btn:active {
+  transform: scale(0.985);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+  transform: none;
+}
+
+.btn-primary {
+  background: var(--brand);
+  color: var(--paper-raised);
+  width: 100%;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--brand-strong);
+}
+
+.btn-quiet {
+  background: none;
+  border-color: var(--line);
+  color: var(--ink);
+  width: 100%;
+}
+
+.btn-quiet:hover:not(:disabled) {
+  background: var(--paper-sunken);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ---- panels, sheets ---- */
+
+.panel {
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.sheet-veil {
+  position: fixed;
+  inset: 0;
+  background: oklch(0.2 0.02 160 / 0.45);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  z-index: 20;
+  animation: veil-in var(--dur) var(--ease);
+}
+
+@keyframes veil-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.sheet {
+  background: var(--paper-raised);
+  border-radius: 16px 16px 0 0;
+  padding: 22px 20px calc(var(--safe-bottom) + 22px);
+  width: 100%;
+  max-width: 480px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  animation: sheet-up 240ms var(--ease);
+}
+
+@keyframes sheet-up {
+  from {
+    transform: translateY(24px);
+    opacity: 0;
+  }
+}
+
+/* ---- forms ---- */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.field input {
+  font: inherit;
+  font-family: var(--serif);
+  font-size: 1.4rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  background: var(--paper-sunken);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  width: 100%;
+  transition: border-color var(--dur) var(--ease);
+}
+
+.field input:focus {
+  border-color: var(--brand);
+  outline: none;
+}
+
+.field input[aria-invalid='true'] {
+  border-color: var(--down);
+}
+
+.field .error {
+  color: var(--down);
+  font-size: 0.8rem;
+}
+
+.check {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  cursor: pointer;
+}
+
+.check input {
+  margin-top: 3px;
+  accent-color: var(--brand);
+  width: 18px;
+  height: 18px;
+}
+
+/* ---- segmented amount presets ---- */
+
+.presets {
+  display: flex;
+  gap: 8px;
+}
+
+.presets button {
+  flex: 1;
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: none;
+  color: var(--ink-soft);
+  padding: 9px 0;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+
+.presets button[aria-pressed='true'] {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: var(--paper-raised);
+}
+
+.presets button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---- misc states ---- */
+
+.skeleton {
+  border-radius: 6px;
+  background: linear-gradient(
+    100deg,
+    var(--paper-sunken) 40%,
+    var(--paper-raised) 50%,
+    var(--paper-sunken) 60%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite linear;
+  color: transparent;
+  user-select: none;
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.empty {
+  text-align: center;
+  padding: 36px 20px;
+  color: var(--ink-faint);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+}
+
+.delta-up {
+  color: var(--up);
+}
+
+.delta-down {
+  color: var(--down);
+}
+
+.hold-btn {
+  position: relative;
+  overflow: hidden;
+}
+
+.hold-btn .fill {
+  position: absolute;
+  inset: 0;
+  background: var(--brand-strong);
+  transform-origin: left;
+  transform: scaleX(0);
+}
+
+.hold-btn.holding .fill {
+  animation: hold-fill 900ms linear forwards;
+}
+
+@keyframes hold-fill {
+  to {
+    transform: scaleX(1);
+  }
+}
+
+.hold-btn span {
+  position: relative;
+}
+
+.notice {
+  border-left: 3px solid var(--gold);
+  background: var(--paper-sunken);
+  padding: 12px 14px;
+  border-radius: 0 8px 8px 0;
+  font-size: 0.88rem;
+  color: var(--ink-soft);
+}
+
+/* ---- Boost risk tiers (Operate: two clear choices, not a token grid) ---- */
+
+.strategy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.strategy-card {
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition:
+    border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+
+.strategy-card-on {
+  border-color: var(--brand);
+  background: var(--brand-tint);
+}
+
+.strategy-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.strategy-title {
+  font-family: var(--serif);
+  font-size: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-transform: none;
+  color: var(--ink);
+  margin: 0;
+}
+
+.risk-pips {
+  display: flex;
+  gap: 4px;
+  padding-top: 4px;
+}
+
+.risk-pip {
+  width: 8px;
+  height: 18px;
+  border-radius: 2px;
+  background: var(--line);
+}
+
+.risk-pip.on {
+  background: var(--gold-deep);
+}
+
+.strategy-card-on .risk-pip.on {
+  background: var(--brand);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

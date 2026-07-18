@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Accrue mark: the monotonic staircase — value only steps up. -->
+  <rect width="1024" height="1024" fill="#2e5344"/>
+  <g fill="#f4f1e6">
+    <rect x="212" y="608" width="150" height="204"/>
+    <rect x="382" y="512" width="150" height="300"/>
+    <rect x="552" y="392" width="150" height="420"/>
+    <!-- final riser breaks the frame upward -->
+    <rect x="722" y="212" width="90" height="600"/>
+    <polygon points="767,132 830,212 704,212"/>
+  </g>
+</svg>
