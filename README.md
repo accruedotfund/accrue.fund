@@ -173,6 +173,14 @@ settlement mental model:
 
 **accrue.fund** · built in public · for people who just want the bag to grow
 
+---
+
+## coin · tribe
+
+[`$ACCRUEFUND`](https://tribe.run/token/DUMA8e5M5AcyhCjKeevWnCVRiKtNpUmMb9nNC4BskdPK) on [Tribe.run](https://tribe.run/token/DUMA8e5M5AcyhCjKeevWnCVRiKtNpUmMb9nNC4BskdPK) — community coin for the open-source project. **not** your dollar vault (USDG / standard). linked from the app under **You**.
+
+mint `DUMA8e5M5AcyhCjKeevWnCVRiKtNpUmMb9nNC4BskdPK`
+
 <!-- hypertribe:sponsors:start -->
 ## Sponsors
 

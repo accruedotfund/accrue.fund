@@ -4,6 +4,11 @@ import { useAuth } from '../lib/auth'
 // Learn surface + the ONE place chain custody is disclosed (legal must say
 // it even though the product surface never does — see README).
 
+/** Tribe.run coin for the open-source project (not the dollar vault). */
+export const TRIBE_TOKEN_MINT = 'DUMA8e5M5AcyhCjKeevWnCVRiKtNpUmMb9nNC4BskdPK'
+export const TRIBE_TOKEN_URL = `https://tribe.run/token/${TRIBE_TOKEN_MINT}`
+export const GITHUB_REPO_URL = 'https://github.com/accruedotfund/accrue.fund'
+
 export default function Profile() {
   const { email, logout } = useAuth()
   const [doc, setDoc] = useState<'none' | 'terms' | 'privacy'>('none')
@@ -33,6 +38,38 @@ export default function Profile() {
       </header>
 
       <div className="ledger">
+        <a
+          className="row"
+          href={TRIBE_TOKEN_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <span className="grow">
+            <span style={{ fontWeight: 600 }}>$ACCRUEFUND</span>
+            <span className="small muted" style={{ display: 'block' }}>
+              Project coin on Tribe.run · not your dollar balance
+            </span>
+          </span>
+          <span className="muted" aria-hidden>
+            →
+          </span>
+        </a>
+        <a
+          className="row"
+          href={GITHUB_REPO_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <span className="grow">
+            <span style={{ fontWeight: 600 }}>Open source</span>
+            <span className="small muted" style={{ display: 'block' }}>
+              GitHub · accruedotfund/accrue.fund
+            </span>
+          </span>
+          <span className="muted" aria-hidden>
+            →
+          </span>
+        </a>
         <button className="row" onClick={() => setDoc('terms')}>
           <span className="grow" style={{ fontWeight: 600 }}>
             Terms of Service
@@ -59,7 +96,8 @@ export default function Profile() {
       <p className="small muted">
         Accrue (accrue.fund) is not a bank and balances are not covered by
         government deposit insurance. Growth rates are variable and not
-        guaranteed.
+        guaranteed. $ACCRUEFUND is a separate community token for the
+        project — not USDG and not your account balance.
       </p>
     </div>
   )
