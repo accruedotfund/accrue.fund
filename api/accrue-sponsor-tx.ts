@@ -5,25 +5,48 @@
  *
  * Body: {
  *   walletId: string
- *   caip2: "eip155:8453" | "eip155:4663" | ...
- *   transaction: { to, data?, value? }  // value as decimal string or 0x hex
+ *   caip2: "eip155:8453" | ...
+ *   transaction: { to, data?, value? }
  * }
  *
- * Privy embedded wallets require a privy-authorization-signature on
- * POST /v1/wallets/{id}/rpc. We use @privy-io/node with the user's JWT so the
- * SDK exchanges it for a user signing key and attaches the header.
+ * User embedded wallets require `privy-authorization-signature` on wallet RPC.
+ * Flow:
+ *  1) Verify user access token
+ *  2) Exchange JWT → user authorization key (via @privy-io/node)
+ *  3) Sign the exact RPC payload
+ *  4) POST /v1/wallets/{id}/rpc with Basic + signature + sponsor:true
  *
- * Env (Vercel Production — never VITE_*):
+ * Env:
  *   PRIVY_APP_ID (or VITE_PRIVY_APP_ID)
  *   PRIVY_APP_SECRET
+ * Optional:
+ *   PRIVY_AUTHORIZATION_PRIVATE_KEY — app owner key if wallet is app-owned
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { PrivyClient, APIError } from '@privy-io/node'
+import {
+  PrivyClient,
+  APIError,
+  formatRequestForAuthorizationSignature,
+  generateAuthorizationSignature,
+  generateAuthorizationSignatures,
+} from '@privy-io/node'
 
 const PRIVY_APP_ID =
   process.env.PRIVY_APP_ID || process.env.VITE_PRIVY_APP_ID || ''
 const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET || ''
+const PRIVY_AUTH_KEY = (process.env.PRIVY_AUTHORIZATION_PRIVATE_KEY || '').trim()
+const PRIVY_API = 'https://api.privy.io'
+
+/** Only Base (and other Privy-listed app-pays chains). RH mainnet is not listed. */
+const SPONSORABLE = new Set([
+  'eip155:1',
+  'eip155:8453',
+  'eip155:10',
+  'eip155:137',
+  'eip155:42161',
+  'eip155:56',
+])
 
 type Body = {
   walletId?: string
@@ -55,7 +78,10 @@ function sleep(ms: number) {
 
 function privyErrorMessage(err: unknown): string {
   if (err instanceof APIError) {
-    const body = err.error as { error?: string; message?: string } | string | null
+    const body = err.error as
+      | { error?: string; message?: string; code?: string }
+      | string
+      | null
     if (typeof body === 'string' && body.trim()) return body
     if (body && typeof body === 'object') {
       if (typeof body.error === 'string' && body.error.trim()) return body.error
@@ -94,10 +120,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     appSecret: PRIVY_APP_SECRET,
   })
 
-  let userId: string
   try {
-    const claims = await privy.utils().auth().verifyAccessToken(token)
-    userId = claims.user_id
+    await privy.utils().auth().verifyAccessToken(token)
   } catch {
     return res.status(401).json({ error: 'invalid session' })
   }
@@ -121,97 +145,277 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!/^0x[a-fA-F0-9]{40}$/.test(to)) {
     return res.status(400).json({ error: 'invalid to' })
   }
-
-  // Confirm wallet is linked to this user (best-effort).
-  try {
-    const user = await privy.users()._get(userId)
-    const accounts = user.linked_accounts || []
-    const ownsId = accounts.some((a) => {
-      const w = a as { type?: string; id?: string }
-      return (
-        (w.type === 'wallet' || w.type === 'smart_wallet') &&
-        w.id === walletId
-      )
+  if (!SPONSORABLE.has(caip2)) {
+    return res.status(400).json({
+      error: `Gas sponsorship is not available on ${caip2}. Use Base (eip155:8453) for fee top-up.`,
+      caip2,
     })
-    if (!ownsId) {
-      // Some linked-wallet shapes omit id — Privy still rejects bad walletId.
-    }
-  } catch {
-    // If user fetch fails, still try send — Privy will reject bad walletId
   }
 
   const chainId = Number(caip2.split(':')[1])
-  const authorization_context = { user_jwts: [token] }
+  const requestExpiry = String(Date.now() + 15 * 60 * 1000)
+
+  const rpcBody = {
+    method: 'eth_sendTransaction' as const,
+    caip2,
+    chain_type: 'ethereum' as const,
+    sponsor: true,
+    params: {
+      transaction: {
+        to,
+        ...(valueHex ? { value: valueHex } : {}),
+        ...(data ? { data } : {}),
+        ...(Number.isFinite(chainId) ? { chain_id: chainId } : {}),
+      },
+    },
+  }
+
+  const url = `${PRIVY_API}/v1/wallets/${encodeURIComponent(walletId)}/rpc`
 
   try {
-    const result = await privy.wallets().ethereum().sendTransaction(walletId, {
-      caip2: caip2 as `eip155:${string}`,
-      sponsor: true,
-      authorization_context,
-      params: {
-        transaction: {
-          to,
-          ...(valueHex ? { value: valueHex } : {}),
-          ...(data ? { data } : {}),
-          ...(Number.isFinite(chainId) ? { chain_id: chainId } : {}),
+    // Build authorization signatures: user JWT (embedded wallets) + optional app key
+    const authorizationContext = {
+      user_jwts: [token],
+      ...(PRIVY_AUTH_KEY
+        ? { authorization_private_keys: [PRIVY_AUTH_KEY] }
+        : {}),
+    }
+
+    let signatures: string[]
+    try {
+      signatures = await generateAuthorizationSignatures(privy, {
+        authorizationContext,
+        input: {
+          version: 1,
+          method: 'POST',
+          url,
+          body: rpcBody,
+          headers: {
+            'privy-app-id': PRIVY_APP_ID,
+            'privy-request-expiry': requestExpiry,
+          },
         },
-      },
-    })
-
-    let hash = String(result.hash || '')
-    const txId = result.transaction_id
-
-    // Sponsored user-ops often return empty hash until confirmed — poll by id.
-    if (!isTxHash(hash) && txId) {
-      for (let i = 0; i < 40; i++) {
-        try {
-          const tx = await privy.transactions().get(txId)
-          if (tx.transaction_hash && isTxHash(tx.transaction_hash)) {
-            hash = tx.transaction_hash
-            break
-          }
-          if (
-            tx.status === 'failed' ||
-            tx.status === 'execution_reverted' ||
-            tx.status === 'provider_error'
-          ) {
-            return res.status(502).json({
-              error: `Sponsored transaction ${tx.status}`,
-              status: tx.status,
-              transaction_id: txId,
-            })
-          }
-        } catch {
-          // keep polling
-        }
-        await sleep(750)
+      })
+    } catch (signErr) {
+      // Fallback: try SDK sendTransaction (also signs) for clearer errors
+      try {
+        const result = await privy.wallets().ethereum().sendTransaction(walletId, {
+          caip2: caip2 as `eip155:${string}`,
+          sponsor: true,
+          authorization_context: authorizationContext,
+          params: {
+            transaction: {
+              to,
+              ...(valueHex ? { value: valueHex } : {}),
+              ...(data ? { data } : {}),
+              ...(Number.isFinite(chainId) ? { chain_id: chainId } : {}),
+            },
+          },
+        })
+        return await finishWithHash(res, privy, result)
+      } catch (sdkErr) {
+        return res.status(502).json({
+          error: privyErrorMessage(signErr) || privyErrorMessage(sdkErr),
+          step: 'authorization_signature',
+        })
       }
     }
 
-    if (!isTxHash(hash)) {
+    const sigHeader = signatures.filter(Boolean).join(',')
+    if (!sigHeader) {
+      // Last-ditch: if only app key is set, sign with it directly
+      if (PRIVY_AUTH_KEY) {
+        const payload = formatRequestForAuthorizationSignature({
+          version: 1,
+          method: 'POST',
+          url,
+          body: rpcBody,
+          headers: {
+            'privy-app-id': PRIVY_APP_ID,
+            'privy-request-expiry': requestExpiry,
+          },
+        })
+        const one = generateAuthorizationSignature({
+          authorizationPrivateKey: PRIVY_AUTH_KEY,
+          input: payload,
+        })
+        if (!one) {
+          return res.status(502).json({
+            error:
+              'Could not build Privy authorization signature (empty). Enable server wallet access / check PRIVY_APP_SECRET matches the app.',
+            step: 'empty_signature',
+          })
+        }
+        return await postRpc(res, privy, walletId, url, rpcBody, one, requestExpiry)
+      }
       return res.status(502).json({
-        error: 'Sponsored send returned no hash yet',
-        transaction_id: txId || null,
-        user_operation_hash: result.user_operation_hash || null,
+        error:
+          'Could not build Privy authorization signature from user session. Re-login and retry, or set PRIVY_AUTHORIZATION_PRIVATE_KEY for app-owned wallets.',
+        step: 'empty_signature',
       })
     }
 
-    return res.status(200).json({
-      hash,
-      sponsored: true,
-      transaction_id: txId || null,
-    })
+    return await postRpc(res, privy, walletId, url, rpcBody, sigHeader, requestExpiry)
   } catch (err) {
-    const message = privyErrorMessage(err)
-    const status =
-      err instanceof APIError && err.status >= 400 && err.status < 600
-        ? err.status
-        : 502
-    // Map upstream 4xx to 502 so the client treats it as sponsor failure
-    // (and can fall through to self-pay), but keep the real Privy message.
-    return res.status(status === 401 || status === 403 ? 502 : status >= 500 ? status : 502).json({
-      error: message,
+    return res.status(502).json({
+      error: privyErrorMessage(err),
       status: err instanceof APIError ? err.status : undefined,
+      step: 'send',
     })
   }
+}
+
+async function postRpc(
+  res: VercelResponse,
+  privy: PrivyClient,
+  walletId: string,
+  url: string,
+  rpcBody: Record<string, unknown>,
+  signature: string,
+  requestExpiry: string,
+) {
+  const basic = Buffer.from(`${PRIVY_APP_ID}:${PRIVY_APP_SECRET}`).toString(
+    'base64',
+  )
+
+  const rpcRes = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${basic}`,
+      'privy-app-id': PRIVY_APP_ID,
+      'privy-authorization-signature': signature,
+      'privy-request-expiry': requestExpiry,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(rpcBody),
+  })
+
+  const rpcJson = (await rpcRes.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >
+
+  if (!rpcRes.ok) {
+    const errField = rpcJson.error
+    let message = `Privy sponsor ${rpcRes.status}`
+    if (typeof errField === 'string' && errField.trim()) {
+      message = errField
+    } else if (errField && typeof errField === 'object' && 'message' in errField) {
+      const m = (errField as { message?: unknown }).message
+      if (typeof m === 'string' && m.trim()) message = m
+    } else if (typeof rpcJson.message === 'string' && rpcJson.message.trim()) {
+      message = rpcJson.message
+    }
+    return res.status(502).json({
+      error: message,
+      status: rpcRes.status,
+      step: 'privy_rpc',
+    })
+  }
+
+  const dataObj = (rpcJson.data || rpcJson) as Record<string, unknown>
+  let hash = String(
+    dataObj.hash ||
+      dataObj.transaction_hash ||
+      dataObj.transactionHash ||
+      '',
+  )
+  const txId = String(
+    dataObj.transaction_id || dataObj.transactionId || '',
+  )
+
+  if (!isTxHash(hash) && txId) {
+    for (let i = 0; i < 40; i++) {
+      try {
+        const tx = await privy.transactions().get(txId)
+        if (tx.transaction_hash && isTxHash(tx.transaction_hash)) {
+          hash = tx.transaction_hash
+          break
+        }
+        if (
+          tx.status === 'failed' ||
+          tx.status === 'execution_reverted' ||
+          tx.status === 'provider_error'
+        ) {
+          return res.status(502).json({
+            error: `Sponsored transaction ${tx.status}`,
+            status: tx.status,
+            transaction_id: txId,
+            step: 'poll',
+          })
+        }
+      } catch {
+        // keep polling
+      }
+      await sleep(750)
+    }
+  }
+
+  if (!isTxHash(hash)) {
+    return res.status(502).json({
+      error: 'Sponsored send returned no hash yet',
+      transaction_id: txId || null,
+      user_operation_hash: dataObj.user_operation_hash || null,
+      step: 'no_hash',
+    })
+  }
+
+  return res.status(200).json({
+    hash,
+    sponsored: true,
+    transaction_id: txId || null,
+  })
+}
+
+async function finishWithHash(
+  res: VercelResponse,
+  privy: PrivyClient,
+  result: {
+    hash?: string
+    transaction_id?: string
+    user_operation_hash?: string
+  },
+) {
+  let hash = String(result.hash || '')
+  const txId = result.transaction_id
+
+  if (!isTxHash(hash) && txId) {
+    for (let i = 0; i < 40; i++) {
+      try {
+        const tx = await privy.transactions().get(txId)
+        if (tx.transaction_hash && isTxHash(tx.transaction_hash)) {
+          hash = tx.transaction_hash
+          break
+        }
+        if (
+          tx.status === 'failed' ||
+          tx.status === 'execution_reverted' ||
+          tx.status === 'provider_error'
+        ) {
+          return res.status(502).json({
+            error: `Sponsored transaction ${tx.status}`,
+            step: 'poll',
+          })
+        }
+      } catch {
+        // keep polling
+      }
+      await sleep(750)
+    }
+  }
+
+  if (!isTxHash(hash)) {
+    return res.status(502).json({
+      error: 'Sponsored send returned no hash yet',
+      transaction_id: txId || null,
+      user_operation_hash: result.user_operation_hash || null,
+      step: 'no_hash',
+    })
+  }
+
+  return res.status(200).json({
+    hash,
+    sponsored: true,
+    transaction_id: txId || null,
+  })
 }
