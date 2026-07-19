@@ -172,3 +172,11 @@ settlement mental model:
 > the rest is plumbing.
 
 **accrue.fund** · built in public · for people who just want the bag to grow
+
+<!-- hypertribe:sponsors:start -->
+## Sponsors
+
+[![accrue.fund Sponsors](https://api.tribe.run/tokens/DUMA8e5M5AcyhCjKeevWnCVRiKtNpUmMb9nNC4BskdPK/sponsors.svg)](https://tribe.run/token/DUMA8e5M5AcyhCjKeevWnCVRiKtNpUmMb9nNC4BskdPK)
+
+Become a sponsor on [Tribe.run](https://tribe.run/token/DUMA8e5M5AcyhCjKeevWnCVRiKtNpUmMb9nNC4BskdPK).
+<!-- hypertribe:sponsors:end -->
