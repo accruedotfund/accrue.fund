@@ -11,6 +11,7 @@ import {
   type RelayDepositRoute,
 } from '../lib/relay'
 import { windDownViaRelay } from '../lib/withdraw'
+import { recordDeposit, recordWithdraw } from '../lib/history'
 import { tokenBalance } from '../lib/vault'
 import type { Holding } from '../lib/nav'
 import {
@@ -241,22 +242,19 @@ export default function Fund({
     if (onRefresh) await onRefresh().catch(() => {})
 
     if (result.kind === 'settled') {
-      let receivedLabel = formatMoney(
-        currency,
-        Number(route.quotedReceived) || value,
-      )
+      let receivedUsd = Number(route.quotedReceived) || value
+      let receivedLabel = formatMoney(currency, receivedUsd)
       try {
         const now = await tokenBalance(rail.stable, address)
         const delta = now > baseline ? now - baseline : 0n
         if (delta > 0n) {
-          receivedLabel = formatMoney(
-            currency,
-            Number(formatUnits(delta, rail.decimals)),
-          )
+          receivedUsd = Number(formatUnits(delta, rail.decimals))
+          receivedLabel = formatMoney(currency, receivedUsd)
         }
       } catch {
         /* use quote */
       }
+      recordDeposit(address, receivedUsd)
       setDepositOutcome({ phase: 'settled', receivedLabel })
       return
     }
@@ -270,12 +268,11 @@ export default function Fund({
     try {
       const now = await tokenBalance(rail.stable, address)
       if (now >= baseline + minBump) {
+        const receivedUsd = Number(formatUnits(now - baseline, rail.decimals))
+        recordDeposit(address, receivedUsd)
         setDepositOutcome({
           phase: 'settled',
-          receivedLabel: formatMoney(
-            currency,
-            Number(formatUnits(now - baseline, rail.decimals)),
-          ),
+          receivedLabel: formatMoney(currency, receivedUsd),
         })
         return
       }
@@ -326,6 +323,10 @@ export default function Fund({
         send: sendTransaction,
         progress: setStatus,
       })
+      // Cost basis: cash-out reduces principal pro-rata to total NAV.
+      const totalNav =
+        (holding?.balance ?? 0) || available + standard
+      recordWithdraw(address, value, totalNav > 0 ? totalNav : undefined)
       if (onRefresh) await onRefresh()
       setWithdrawSettled(true)
 

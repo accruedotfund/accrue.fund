@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useAuth } from './lib/auth'
 import { readUsdWrapper } from './lib/factory'
+import { recordSnapshot } from './lib/history'
 import { fetchHoldings, type Holding } from './lib/nav'
 import { setRailWrapper, type CurrencyCode } from './lib/rails'
 import Home from './screens/Home'
@@ -48,8 +49,19 @@ export default function App() {
       } catch {
         /* ignore */
       }
-      setHoldings(await fetchHoldings(address))
+      const next = await fetchHoldings(address)
+      setHoldings(next)
       setLoadError(false)
+      // Snapshot for balance chart + cost basis (local, per wallet).
+      const usd = next.find((h) => h.rail.code === 'USD')
+      if (usd && address) {
+        recordSnapshot(address, {
+          total: usd.balance,
+          available: usd.availableBalance,
+          standard: usd.standardBalance,
+          boost: usd.boostBalance,
+        })
+      }
     } catch {
       setLoadError(true)
     }

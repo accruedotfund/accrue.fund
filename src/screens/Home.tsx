@@ -1,10 +1,20 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
+import BalanceChart from '../components/BalanceChart'
+import { statsFor, type HistoryStats } from '../lib/history'
 import type { Holding } from '../lib/nav'
 import { RAILS, formatMoney, type CurrencyCode } from '../lib/rails'
+import { useAuth } from '../lib/auth'
 
-// Monitor surface: total first (biggest thing, top-left), then a dense
-// ledger of accounts. Rows, not cards; nothing centered.
-// USD is always open when status=live — never "Soon".
+// Monitor surface: total, chart (balance vs cost basis), ledger.
+
+type WindowKey = '1d' | '7d' | '30d' | 'all'
+
+const WINDOWS: { id: WindowKey; label: string; ms: number }[] = [
+  { id: '1d', label: '1D', ms: 24 * 60 * 60 * 1000 },
+  { id: '7d', label: '7D', ms: 7 * 24 * 60 * 60 * 1000 },
+  { id: '30d', label: '30D', ms: 30 * 24 * 60 * 60 * 1000 },
+  { id: 'all', label: 'All', ms: 10 * 365 * 24 * 60 * 60 * 1000 },
+]
 
 export default function Home({
   holdings,
@@ -19,6 +29,9 @@ export default function Home({
   onFund: () => void
   onAccount: (code: CurrencyCode) => void
 }) {
+  const { address } = useAuth()
+  const [win, setWin] = useState<WindowKey>('7d')
+
   const funded = useMemo(
     () => (holdings ?? []).filter((h) => h.balance > 0),
     [holdings],
@@ -28,6 +41,19 @@ export default function Home({
     [holdings],
   )
 
+  const total = usdHolding?.balance ?? 0
+  const windowMs = WINDOWS.find((w) => w.id === win)!.ms
+
+  const stats: HistoryStats = useMemo(
+    () => statsFor(address, total, windowMs),
+    // recompute when holdings tick (address+total) or window changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [address, total, windowMs, holdings],
+  )
+
+  const pnlUp = stats.pnl >= 0
+  const winUp = stats.windowChange >= 0
+
   return (
     <div className="screen">
       <header style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -36,7 +62,7 @@ export default function Home({
           <div className="skeleton" style={{ height: 48, width: '70%' }} />
         ) : (
           <p className="display">
-            {formatMoney('USD', usdHolding?.balance ?? 0)}
+            {formatMoney('USD', total)}
           </p>
         )}
         <p className="small muted">
@@ -59,6 +85,79 @@ export default function Home({
         </div>
       )}
 
+      {holdings !== null && (
+        <section className="chart-card" aria-label="Balance over time">
+          <div className="chart-tabs" role="tablist" aria-label="Time range">
+            {WINDOWS.map((w) => (
+              <button
+                key={w.id}
+                type="button"
+                role="tab"
+                aria-selected={win === w.id}
+                className={win === w.id ? 'chart-tab on' : 'chart-tab'}
+                onClick={() => setWin(w.id)}
+              >
+                {w.label}
+              </button>
+            ))}
+          </div>
+
+          <BalanceChart
+            points={stats.points}
+            costBasis={stats.costBasis > 0 ? stats.costBasis : undefined}
+          />
+
+          <div className="stat-grid">
+            <div className="stat">
+              <div className="stat-k">Cost basis</div>
+              <div className="stat-v figure">
+                {formatMoney('USD', stats.costBasis)}
+              </div>
+            </div>
+            <div className="stat">
+              <div className="stat-k">P&amp;L</div>
+              <div
+                className="stat-v figure"
+                style={{ color: pnlUp ? 'var(--up)' : 'var(--down)' }}
+              >
+                {pnlUp ? '+' : ''}
+                {formatMoney('USD', stats.pnl)}
+                <span className="small muted" style={{ marginLeft: 6 }}>
+                  {pnlUp ? '+' : ''}
+                  {stats.pnlPct.toFixed(1)}%
+                </span>
+              </div>
+            </div>
+            <div className="stat">
+              <div className="stat-k">
+                {win === 'all' ? 'Since start' : `Change · ${win.toUpperCase()}`}
+              </div>
+              <div
+                className="stat-v figure"
+                style={{ color: winUp ? 'var(--up)' : 'var(--down)' }}
+              >
+                {winUp ? '+' : ''}
+                {formatMoney('USD', stats.windowChange)}
+                <span className="small muted" style={{ marginLeft: 6 }}>
+                  {winUp ? '+' : ''}
+                  {stats.windowChangePct.toFixed(1)}%
+                </span>
+              </div>
+            </div>
+            <div className="stat">
+              <div className="stat-k">Avg balance</div>
+              <div className="stat-v figure">
+                {formatMoney('USD', stats.avgBalance)}
+              </div>
+            </div>
+          </div>
+          <p className="small muted" style={{ marginTop: 8 }}>
+            Cost basis is average capital in (deposits minus cash-outs). Chart
+            builds as you use the app — stored on this device.
+          </p>
+        </section>
+      )}
+
       <section>
         <h2 style={{ marginBottom: 8 }}>Accounts</h2>
         {holdings === null ? (
@@ -73,7 +172,6 @@ export default function Home({
           <div className="ledger">
             {RAILS.map((rail) => {
               const h = holdings.find((x) => x.rail.code === rail.code)
-              // Only non-USD rails (or status coming_soon) are "Soon".
               const soon = rail.status === 'coming_soon'
               const open = !soon
               return (

@@ -638,3 +638,127 @@ p {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---- balance chart (Home: balance/time + cost basis) ---- */
+
+.chart-card {
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chart-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 2px;
+  background: var(--paper-sunken);
+  border-radius: 8px;
+  width: fit-content;
+  max-width: 100%;
+}
+
+.chart-tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition:
+    background var(--dur) var(--ease),
+    color var(--dur) var(--ease);
+}
+
+.chart-tab:hover {
+  color: var(--ink-soft);
+}
+
+.chart-tab.on {
+  background: var(--paper-raised);
+  color: var(--ink);
+  box-shadow: 0 0 0 1px var(--line);
+}
+
+.chart-wrap {
+  width: 100%;
+  margin: 0 -2px;
+}
+
+.chart-empty {
+  min-height: 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 24px 12px;
+  border-radius: 8px;
+  background: var(--paper-sunken);
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 2px;
+}
+
+.chart-swatch {
+  display: inline-block;
+  width: 12px;
+  height: 3px;
+  border-radius: 1px;
+  vertical-align: middle;
+  margin-right: 2px;
+  background: var(--up);
+}
+
+.chart-swatch.dashed {
+  background: transparent;
+  border-top: 2px dashed var(--ink-faint);
+  height: 0;
+  width: 14px;
+  vertical-align: middle;
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 14px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+
+.stat {
+  min-width: 0;
+}
+
+.stat-k {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-bottom: 2px;
+}
+
+.stat-v {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.25;
+  word-break: break-word;
+}
+
+.stat-v .small {
+  font-weight: 500;
+}
