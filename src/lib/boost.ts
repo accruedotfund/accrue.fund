@@ -108,6 +108,16 @@ const factoryAbi = [
     ],
     outputs: [{ type: 'address' }],
   },
+  {
+    type: 'function',
+    name: 'createPair',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'tokenA', type: 'address' },
+      { name: 'tokenB', type: 'address' },
+    ],
+    outputs: [{ type: 'address' }],
+  },
 ] as const
 
 const vaultAbi = [
@@ -130,6 +140,20 @@ const vaultAbi = [
       { name: 'assets', type: 'uint256' },
       { name: 'receiver', type: 'address' },
     ],
+    outputs: [{ type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'convertToAssets',
+    stateMutability: 'view',
+    inputs: [{ name: 'shares', type: 'uint256' }],
+    outputs: [{ type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'convertToShares',
+    stateMutability: 'view',
+    inputs: [{ name: 'assets', type: 'uint256' }],
     outputs: [{ type: 'uint256' }],
   },
 ] as const
@@ -544,92 +568,164 @@ async function enterSteady(
   const wrapper = await resolveUsdWrapper()
   if (!wrapper || !BOOST_ROUTER) throw new Error('Steady Boost is not configured')
 
-  // RH gas (sponsor → top-up from Base)
   const { ensureRhGas } = await import('./gasBridge')
   await ensureRhGas({ owner, send, progress })
 
-  const [shares, cashBefore] = await Promise.all([
-    tokenBalance(wrapper, owner),
-    tokenBalance(pool.cash, owner),
-  ])
-  if (shares < 2n && cashBefore === 0n) {
+  // —— Split free value 50/50 cash ↔ shares (asset terms) ——
+  progress('Balancing cash and standard for Steady…')
+  let cashBal = await tokenBalance(pool.cash, owner)
+  let shareBal = await tokenBalance(wrapper, owner)
+  if (cashBal === 0n && shareBal === 0n) {
     throw new Error('No standard balance to boost')
   }
 
-  // Prefer standard shares: redeem half into cash, LP cash + remaining shares.
-  if (shares >= 2n) {
-    progress(
-      pool.bootstrap
-        ? 'Seeding Steady — splitting your balance…'
-        : 'Preparing equal parts of your balance…',
-    )
+  const assetsOf = async (shares: bigint) => {
+    if (shares === 0n) return 0n
+    return publicClient.readContract({
+      address: wrapper,
+      abi: vaultAbi,
+      functionName: 'convertToAssets',
+      args: [shares],
+    })
+  }
+  const sharesOf = async (assets: bigint) => {
+    if (assets === 0n) return 0n
+    return publicClient.readContract({
+      address: wrapper,
+      abi: vaultAbi,
+      functionName: 'convertToShares',
+      args: [assets],
+    })
+  }
+
+  let shareAssets = await assetsOf(shareBal)
+  let total = cashBal + shareAssets
+  if (total < 10n ** 4n) throw new Error('Balance too small to boost')
+  const half = total / 2n
+
+  // Too many shares → redeem excess into cash
+  if (shareAssets > half + 1n) {
+    const excessAssets = shareAssets - half
+    let toRedeem = await sharesOf(excessAssets)
+    if (toRedeem === 0n) toRedeem = shareBal / 2n
+    if (toRedeem > shareBal) toRedeem = shareBal
+    if (toRedeem > 0n) {
+      await sendAndWait(send, {
+        to: wrapper,
+        data: encodeFunctionData({
+          abi: vaultAbi,
+          functionName: 'redeem',
+          args: [toRedeem, owner, owner],
+        }),
+      })
+    }
+  } else if (cashBal > half + 1n) {
+    // Too much cash → deposit excess into standard shares
+    const excessCash = cashBal - half
+    await ensureAllowance(pool.cash, owner, wrapper, excessCash, send, progress)
     await sendAndWait(send, {
       to: wrapper,
       data: encodeFunctionData({
         abi: vaultAbi,
-        functionName: 'redeem',
-        args: [shares / 2n, owner, owner],
+        functionName: 'deposit',
+        args: [excessCash, owner],
       }),
     })
   }
 
-  const [cashAfter, wrapperBal] = await Promise.all([
-    tokenBalance(pool.cash, owner),
-    tokenBalance(wrapper, owner),
-  ])
-  const cashForBoost =
-    shares >= 2n ? balanceIncrease(cashAfter, cashBefore) : cashAfter
-  if (cashForBoost <= 0n || wrapperBal === 0n) {
-    throw new Error('The balance could not be prepared for Steady Boost')
+  cashBal = await tokenBalance(pool.cash, owner)
+  shareBal = await tokenBalance(wrapper, owner)
+  if (cashBal === 0n || shareBal === 0n) {
+    throw new Error('Need both cash and standard shares for Steady — try again')
   }
 
-  // Bootstrap (empty/new pair): use full amounts. Live pool: match ratio.
+  // Live pool: match ratio. Bootstrap / empty: use full balanced bags.
   let amounts: { a: bigint; b: bigint }
-  if (pool.bootstrap || pool.cashReserve === 0n || pool.riskReserve === 0n) {
-    amounts = { a: cashForBoost, b: wrapperBal }
+  const bootstrap =
+    pool.bootstrap ||
+    pool.pair === zeroAddress ||
+    pool.cashReserve === 0n ||
+    pool.riskReserve === 0n
+
+  if (bootstrap) {
+    amounts = { a: cashBal, b: shareBal }
   } else {
-    const sides =
-      pool.pair !== zeroAddress
-        ? await readPairSides(pool.pair, pool.cash)
-        : { cashReserve: pool.cashReserve, riskReserve: pool.riskReserve }
+    const sides = await readPairSides(pool.pair, pool.cash)
     amounts = optimalAmounts(
-      cashForBoost,
-      wrapperBal,
+      cashBal,
+      shareBal,
       sides.cashReserve,
       sides.riskReserve,
     )
   }
   if (amounts.a === 0n || amounts.b === 0n) {
-    throw new Error('Steady position could not be sized — need balance on both sides')
+    throw new Error('Steady position could not be sized')
+  }
+
+  // createPair first (own tx) — createPair+addLiquidity in one shot often OOGs.
+  if (bootstrap) {
+    const existing = await resolvePair(pool.cash, wrapper, steadyPairOverride())
+    if (!existing) {
+      progress('Creating Steady market…')
+      try {
+        await sendAndWait(send, {
+          to: PAIR_FACTORY,
+          data: encodeFunctionData({
+            abi: factoryAbi,
+            functionName: 'createPair',
+            args: [pool.cash, wrapper],
+          }),
+        })
+      } catch (e) {
+        // Pair may already exist from a race; continue if getPair works.
+        const again = await resolvePair(pool.cash, wrapper)
+        if (!again) {
+          const m = e instanceof Error ? e.message : 'createPair failed'
+          throw new Error(
+            /unknown reason|reverted/i.test(m)
+              ? 'Could not create Steady market. Check network fee and try again.'
+              : m,
+          )
+        }
+      }
+    }
   }
 
   await ensureAllowance(pool.cash, owner, BOOST_ROUTER, amounts.a, send, progress)
   await ensureAllowance(wrapper, owner, BOOST_ROUTER, amounts.b, send, progress)
   progress(
-    pool.bootstrap
-      ? 'Opening Steady pool and boosting…'
-      : 'Turning on Steady Boost…',
+    bootstrap ? 'Seeding Steady with your balance…' : 'Turning on Steady Boost…',
   )
-  // First LP: mins 0. Later: 5% slack.
-  const minA = pool.bootstrap ? 0n : minAfterSlippage(amounts.a, 500n)
-  const minB = pool.bootstrap ? 0n : minAfterSlippage(amounts.b, 500n)
-  await sendAndWait(send, {
-    to: BOOST_ROUTER,
-    data: encodeFunctionData({
-      abi: routerAbi,
-      functionName: 'addLiquidity',
-      args: [
-        pool.cash,
-        wrapper,
-        amounts.a,
-        amounts.b,
-        minA,
-        minB,
-        owner,
-        deadline(),
-      ],
-    }),
-  })
+
+  const minA = bootstrap ? 0n : minAfterSlippage(amounts.a, 500n)
+  const minB = bootstrap ? 0n : minAfterSlippage(amounts.b, 500n)
+  try {
+    await sendAndWait(send, {
+      to: BOOST_ROUTER,
+      data: encodeFunctionData({
+        abi: routerAbi,
+        functionName: 'addLiquidity',
+        args: [
+          pool.cash,
+          wrapper,
+          amounts.a,
+          amounts.b,
+          minA,
+          minB,
+          owner,
+          deadline(),
+        ],
+      }),
+    })
+  } catch (e) {
+    const m = e instanceof Error ? e.message : ''
+    if (/INSUFFICIENT_[AB]_AMOUNT|unknown reason|reverted/i.test(m)) {
+      throw new Error(
+        'Steady liquidity mint failed. Try again — if it keeps failing, keep funds in Standard for now.',
+      )
+    }
+    throw e
+  }
 }
 
 async function enterGrowth(
