@@ -194,6 +194,77 @@ export async function fetchRelayIntentStatus(
   return 'unknown'
 }
 
+export type DepositSettlement =
+  | { kind: 'settled'; via: 'relay' | 'balance' }
+  | { kind: 'failed'; reason: string }
+  | { kind: 'timeout' }
+
+/**
+ * After the payment partner is given the Relay deposit address, poll until
+ * the intent succeeds or the user's destination balance clearly increases.
+ * Consumer UI: show "arriving…" then success — no chain jargon.
+ */
+export async function waitForDepositSettlement(opts: {
+  requestId: string
+  /** Return true when available balance (or total) has clearly increased. */
+  balanceIncreased?: () => Promise<boolean>
+  progress?: (message: string) => void
+  /** Max wait (default ~3 min). */
+  attempts?: number
+  intervalMs?: number
+  signal?: AbortSignal
+}): Promise<DepositSettlement> {
+  const attempts = opts.attempts ?? 60
+  const intervalMs = opts.intervalMs ?? 3000
+  opts.progress?.('Waiting for your payment to arrive…')
+
+  for (let i = 0; i < attempts; i++) {
+    if (opts.signal?.aborted) {
+      return { kind: 'timeout' }
+    }
+    try {
+      const status = await fetchRelayIntentStatus(opts.requestId)
+      if (status === 'success') {
+        return { kind: 'settled', via: 'relay' }
+      }
+      if (status === 'failure' || status === 'refund') {
+        return {
+          kind: 'failed',
+          reason:
+            status === 'refund'
+              ? 'The deposit was returned. Nothing was kept — try again.'
+              : 'The deposit route could not complete. Nothing was kept — try again.',
+        }
+      }
+    } catch {
+      /* status endpoint blip — keep polling */
+    }
+
+    if (opts.balanceIncreased) {
+      try {
+        if (await opts.balanceIncreased()) {
+          return { kind: 'settled', via: 'balance' }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    if (i === 4) {
+      opts.progress?.(
+        'Payment received or still processing — routing to your dollar account…',
+      )
+    } else if (i === 15) {
+      opts.progress?.(
+        'Still confirming. This can take a few minutes after payment…',
+      )
+    }
+
+    await new Promise((r) => setTimeout(r, intervalMs))
+  }
+  return { kind: 'timeout' }
+}
+
 export interface RelayWithdrawRoute {
   /** Address the app sends the Robinhood asset to. */
   depositAddress: Address

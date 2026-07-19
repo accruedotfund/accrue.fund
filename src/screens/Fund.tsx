@@ -1,13 +1,16 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Browser } from '@capacitor/browser'
 import { useFundWallet } from '@privy-io/react-auth'
 import { base } from 'viem/chains'
+import { formatUnits } from 'viem'
 import { useAuth } from '../lib/auth'
 import {
   prepareRelayDepositRoute,
+  waitForDepositSettlement,
   type RelayDepositRoute,
 } from '../lib/relay'
 import { withdrawAvailableViaRelay } from '../lib/withdraw'
+import { tokenBalance } from '../lib/vault'
 import type { Holding } from '../lib/nav'
 import {
   API_BASE,
@@ -19,12 +22,20 @@ import {
 
 // Configure surface: pick direction, currency, amount → review → how to pay → send.
 // In: user chooses payment partner → Base USDC at Relay deposit → Relay → RH USDG.
-// Never force Coinbase — many users have no Coinbase account.
+// After pay: poll Relay + on-chain balance and show settled success.
 // Out: available USDG → Relay → Base USDC; optional bank URL via API_BASE.
 
 type Direction = 'in' | 'out'
 /** How the user funds the Base USDC deposit leg. */
 type PayMethod = 'card' | 'coinbase' | 'moonpay' | 'choose'
+/** Deposit feedback after the payment UI closes. */
+type DepositOutcome =
+  | null
+  | { phase: 'waiting'; message: string }
+  | { phase: 'settled'; receivedLabel: string }
+  | { phase: 'failed'; message: string }
+  | { phase: 'timeout'; message: string }
+
 const PRESETS = [50, 200, 1000]
 
 const PAY_METHODS: {
@@ -92,8 +103,15 @@ export default function Fund({
   const [depositRoute, setDepositRoute] = useState<RelayDepositRoute | null>(
     null,
   )
-  /** Default card/bank — not Coinbase (no account required). */
   const [payMethod, setPayMethod] = useState<PayMethod>('card')
+  const [depositOutcome, setDepositOutcome] = useState<DepositOutcome>(null)
+  const settleAbort = useRef<AbortController | null>(null)
+
+  useEffect(() => {
+    return () => {
+      settleAbort.current?.abort()
+    }
+  }, [])
 
   const value = parseFloat(amount)
   const rail = RAILS.find((item) => item.code === currency)!
@@ -119,6 +137,17 @@ export default function Fund({
     setError(null)
   }
 
+  function clearDepositFlow() {
+    settleAbort.current?.abort()
+    settleAbort.current = null
+    setDone(false)
+    setDepositOutcome(null)
+    setAmount('')
+    setDepositRoute(null)
+    setStatus(null)
+    setError(null)
+  }
+
   function fundOptionsFor(method: PayMethod) {
     const baseOpts = {
       chain: base,
@@ -127,7 +156,6 @@ export default function Fund({
     }
     switch (method) {
       case 'card':
-        // Card/bank without locking Coinbase — user need not have a CB account.
         return { ...baseOpts, defaultFundingMethod: 'card' as const }
       case 'coinbase':
         return {
@@ -142,9 +170,93 @@ export default function Fund({
           card: { preferredProvider: 'moonpay' as const },
         }
       case 'choose':
-        // Full Privy funding menu (card / exchange / transfer).
         return baseOpts
     }
+  }
+
+  async function watchDepositSettlement(route: RelayDepositRoute) {
+    if (!address || !rail.stable) return
+    settleAbort.current?.abort()
+    const ac = new AbortController()
+    settleAbort.current = ac
+
+    const baseline = await tokenBalance(rail.stable, address).catch(() => 0n)
+    // ~half of quoted receive or $0.50 floor — ignore dust noise
+    const minBump = (() => {
+      const q = Number(route.quotedReceived)
+      if (Number.isFinite(q) && q > 0) {
+        return BigInt(Math.max(1, Math.floor(q * 0.4 * 10 ** rail.decimals)))
+      }
+      return 10n ** BigInt(Math.max(0, rail.decimals - 1)) // 0.1 unit
+    })()
+
+    setDepositOutcome({
+      phase: 'waiting',
+      message: 'Waiting for your payment to land in your dollar account…',
+    })
+
+    const result = await waitForDepositSettlement({
+      requestId: route.requestId,
+      signal: ac.signal,
+      progress: (msg) =>
+        setDepositOutcome({ phase: 'waiting', message: msg }),
+      balanceIncreased: async () => {
+        const now = await tokenBalance(rail.stable!, address)
+        return now >= baseline + minBump
+      },
+    })
+
+    if (ac.signal.aborted) return
+
+    if (onRefresh) await onRefresh().catch(() => {})
+
+    if (result.kind === 'settled') {
+      let receivedLabel = formatMoney(
+        currency,
+        Number(route.quotedReceived) || value,
+      )
+      try {
+        const now = await tokenBalance(rail.stable, address)
+        const delta = now > baseline ? now - baseline : 0n
+        if (delta > 0n) {
+          receivedLabel = formatMoney(
+            currency,
+            Number(formatUnits(delta, rail.decimals)),
+          )
+        }
+      } catch {
+        /* use quote */
+      }
+      setDepositOutcome({ phase: 'settled', receivedLabel })
+      return
+    }
+
+    if (result.kind === 'failed') {
+      setDepositOutcome({ phase: 'failed', message: result.reason })
+      return
+    }
+
+    // Timeout: money may still arrive — refresh and soft-success if balance moved
+    try {
+      const now = await tokenBalance(rail.stable, address)
+      if (now >= baseline + minBump) {
+        setDepositOutcome({
+          phase: 'settled',
+          receivedLabel: formatMoney(
+            currency,
+            Number(formatUnits(now - baseline, rail.decimals)),
+          ),
+        })
+        return
+      }
+    } catch {
+      /* ignore */
+    }
+    setDepositOutcome({
+      phase: 'timeout',
+      message:
+        'Still confirming. Check Home in a minute — your balance updates when the deposit finishes.',
+    })
   }
 
   async function go() {
@@ -171,13 +283,14 @@ export default function Fund({
           address: depositRoute.depositAddress,
           options: fundOptionsFor(payMethod),
         })
+        // Payment UI closed — watch on-chain / Relay settle for real feedback.
         setDone(true)
+        setBusy(false)
+        setStatus(null)
+        void watchDepositSettlement(depositRoute)
         return
       }
 
-      // —— withdraw ——
-      // 1) Always settle available USDG → Base USDC (same wallet) via Relay.
-      // 2) If API returns a Coinbase/bank URL, open cashout (USDC → bank).
       await withdrawAvailableViaRelay({
         rail,
         owner: address,
@@ -210,7 +323,6 @@ export default function Fund({
             return
           }
         }
-        // mode === 'relay' or API miss: Base USDC already in wallet — done.
       }
       setDone(true)
     } catch (err) {
@@ -221,26 +333,106 @@ export default function Fund({
     }
   }
 
+  if (done && direction === 'in') {
+    const outcome = depositOutcome
+    const waiting = !outcome || outcome.phase === 'waiting'
+    const settled = outcome?.phase === 'settled'
+    const failed = outcome?.phase === 'failed'
+    const timedOut = outcome?.phase === 'timeout'
+
+    return (
+      <div className="screen" style={{ justifyContent: 'center' }}>
+        <div className="empty">
+          <p className="display" style={{ fontSize: '1.8rem' }}>
+            {settled
+              ? 'Money arrived'
+              : failed
+                ? 'Deposit didn’t complete'
+                : timedOut
+                  ? 'Still confirming'
+                  : 'Deposit on the way'}
+          </p>
+
+          {settled && (
+            <>
+              <p
+                className="figure"
+                style={{ fontSize: '2.2rem', margin: '8px 0 0' }}
+              >
+                +{outcome.receivedLabel}
+              </p>
+              <p className="small muted" style={{ maxWidth: '34ch' }}>
+                It’s in your dollar account as available balance — ready to grow
+                or withdraw when you are.
+              </p>
+            </>
+          )}
+
+          {waiting && (
+            <p className="small" style={{ maxWidth: '34ch' }} aria-live="polite">
+              {outcome?.phase === 'waiting'
+                ? outcome.message
+                : 'Waiting for your payment to land in your dollar account…'}
+            </p>
+          )}
+
+          {(failed || timedOut) && outcome && 'message' in outcome && (
+            <p className="small" style={{ maxWidth: '34ch' }} role="alert">
+              {outcome.message}
+            </p>
+          )}
+
+          <div
+            style={{
+              display: 'flex',
+              gap: 10,
+              marginTop: 8,
+              flexWrap: 'wrap',
+              justifyContent: 'center',
+            }}
+          >
+            {waiting && (
+              <button
+                className="btn btn-quiet"
+                style={{ width: 'auto', padding: '10px 22px' }}
+                onClick={() => {
+                  if (onRefresh) void onRefresh()
+                }}
+              >
+                Refresh balance
+              </button>
+            )}
+            <button
+              className="btn btn-primary"
+              style={{ width: 'auto', padding: '10px 22px' }}
+              onClick={() => {
+                clearDepositFlow()
+                if (onRefresh) void onRefresh()
+              }}
+            >
+              {settled ? 'Back to account' : 'Done'}
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   if (done) {
     return (
       <div className="screen" style={{ justifyContent: 'center' }}>
         <div className="empty">
           <p className="display" style={{ fontSize: '1.8rem' }}>
-            {direction === 'in' ? 'Deposit started' : 'Withdrawal sent'}
+            Withdrawal sent
           </p>
           <p className="small" style={{ maxWidth: '34ch' }}>
-            {direction === 'in'
-              ? 'Finish the secure payment step. Your payment is then routed to your dollar account — usually within a few minutes.'
-              : 'Your dollars are on Base first, then Coinbase (or your bank partner) for cash out. Bank arrival is typically 1–2 business days after you finish that step.'}
+            Your dollars are on Base first, then your cash-out partner for bank
+            arrival — typically 1–2 business days after you finish that step.
           </p>
           <button
             className="btn btn-quiet"
             style={{ width: 'auto', padding: '10px 22px' }}
-            onClick={() => {
-              setDone(false)
-              setAmount('')
-              setDepositRoute(null)
-            }}
+            onClick={clearDepositFlow}
           >
             Done
           </button>
