@@ -151,12 +151,12 @@ export async function ensureRhGas({
     throw new Error('Could not prepare network-fee top-up route.')
   }
 
-  // sponsor: false — user pays Base gas from remaining ETH (avoids Privy app-secret error).
+  // Prefer sponsored gas (client → server PRIVY_APP_SECRET → self-pay fallback).
   const hash = await send({
     to: depositAddress,
     value,
     chainId: BASE_CHAIN_ID,
-    sponsor: false,
+    sponsor: true,
   })
   const receipt = await baseClient.waitForTransactionReceipt({ hash })
   if (receipt.status !== 'success') {
