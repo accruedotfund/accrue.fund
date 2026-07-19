@@ -99,9 +99,13 @@ export const RAILS: Rail[] = [
 export const railFor = (code: CurrencyCode): Rail =>
   RAILS.find((r) => r.code === code)!
 
-/** True when the rail can accept deposits / show balances. */
+/** Product is open (USD today) — can fund even before wrapper exists. */
+export const isOpen = (r: Rail): boolean =>
+  r.status === 'live' && Boolean(r.stable)
+
+/** Fully configured for standard wrap + boost (needs wrapper address). */
 export const isLive = (r: Rail): boolean =>
-  r.status === 'live' && Boolean(r.stable && r.wrapper)
+  isOpen(r) && Boolean(r.wrapper)
 
 export const isBoostLive = (r: Rail): boolean =>
   Boolean(r.stable && r.wrapper && r.boostPair && BOOST_ROUTER)

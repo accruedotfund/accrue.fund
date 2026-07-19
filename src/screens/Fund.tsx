@@ -1,9 +1,9 @@
 import { useState } from 'react'
 import { Browser } from '@capacitor/browser'
-import { useFiatOnramp } from '@privy-io/react-auth'
+import { useFundWallet } from '@privy-io/react-auth'
+import { base } from 'viem/chains'
 import { useAuth } from '../lib/auth'
 import {
-  RELAY_ORIGIN_ASSET,
   prepareRelayDepositRoute,
   type RelayDepositRoute,
 } from '../lib/relay'
@@ -18,7 +18,9 @@ import {
 } from '../lib/rails'
 
 // Configure surface: pick direction, currency, amount → review → pay/send.
-// In: Privy pays Base deposit address → Relay → USDG on Robinhood.
+// In: Privy → Coinbase card onramp (preferred) → Base USDC at Relay deposit
+//     address → Relay fills USDG on Robinhood. Prefer Coinbase so MoonPay’s
+//     geo dead-end is not the default handoff.
 // Out: available USDG → Relay → Base USDC; optional bank URL via API_BASE.
 
 type Direction = 'in' | 'out'
@@ -51,7 +53,7 @@ export default function Fund({
 }) {
   const { email, address, getAccessToken, sendTransaction, walletReady } =
     useAuth()
-  const { fund } = useFiatOnramp()
+  const { fundWallet } = useFundWallet()
   const [direction, setDirection] = useState<Direction>('in')
   const [currency, setCurrency] = useState<CurrencyCode>('USD')
   const [amount, setAmount] = useState('')
@@ -107,21 +109,17 @@ export default function Fund({
           return
         }
         setStatus('Opening secure payment…')
-        await fund({
-          source: {
-            assets: ['usd', 'eur', 'gbp'],
-            defaultAsset: sourceCurrency.toLowerCase() as
-              | 'usd'
-              | 'eur'
-              | 'gbp',
+        // Preferred card provider = Coinbase (dashboard must keep Coinbase Onramp
+        // enabled). defaultFundingMethod skips method pickers when possible.
+        await fundWallet({
+          address: depositRoute.depositAddress,
+          options: {
+            chain: base,
+            amount: String(value),
+            asset: 'USDC',
+            defaultFundingMethod: 'card',
+            card: { preferredProvider: 'coinbase' },
           },
-          destination: {
-            address: depositRoute.depositAddress,
-            chain: 'eip155:8453',
-            asset: RELAY_ORIGIN_ASSET,
-          },
-          environment: import.meta.env.PROD ? 'production' : 'sandbox',
-          defaultAmount: String(value),
         })
         setDone(true)
         return

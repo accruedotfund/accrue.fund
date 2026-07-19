@@ -29,29 +29,48 @@ export default function App() {
   const [bootStatus, setBootStatus] = useState<string | null>(null)
   const [bootError, setBootError] = useState<string | null>(null)
 
+  const humanBootError = (err: unknown): string => {
+    const msg = err instanceof Error ? err.message : String(err ?? '')
+    if (/app secret is required/i.test(msg) || /gas sponsored/i.test(msg)) {
+      return 'Network fees for setup need Privy gas sponsorship: App pays + Robinhood Chain + “Allow transactions from the client”. You can still add money; Standard growth unlocks after that.'
+    }
+    if (/sponsor|gas sponsorship/i.test(msg)) {
+      return 'Gas sponsorship is not ready yet. You can still add money — Standard account setup will finish once sponsorship is on.'
+    }
+    return msg || 'Could not finish account setup. You can still add money.'
+  }
+
   const ensureRail = useCallback(async () => {
     if (!walletReady || !address) return
     setBootError(null)
     try {
+      // Always discover existing wrapper (no gas needed).
       let wrapper = await readUsdWrapper()
-      if (!wrapper) {
-        setBootStatus('Opening your dollar account…')
-        wrapper = await ensureUsdWrapper(sendTransaction, setBootStatus)
+      if (wrapper) {
+        setRailWrapper('USD', wrapper)
+        setBootStatus(null)
+        return
       }
+      // Create requires sponsored gas — may fail until Privy is configured.
+      setBootStatus('Opening standard dollar growth…')
+      wrapper = await ensureUsdWrapper(sendTransaction, setBootStatus)
       setRailWrapper('USD', wrapper)
       setBootStatus(null)
     } catch (err) {
       setBootStatus(null)
-      setBootError(
-        err instanceof Error
-          ? err.message
-          : 'Could not open the dollar account. Check gas sponsorship, then retry.',
-      )
+      setBootError(humanBootError(err))
     }
   }, [walletReady, address, sendTransaction])
 
   const refresh = useCallback(async () => {
     try {
+      // Prefer on-chain wrapper discovery even if create failed.
+      try {
+        const w = await readUsdWrapper()
+        if (w) setRailWrapper('USD', w)
+      } catch {
+        /* ignore */
+      }
       setHoldings(await fetchHoldings(address))
       setLoadError(false)
     } catch {
@@ -61,12 +80,14 @@ export default function App() {
 
   useEffect(() => {
     if (!authenticated) return
-    void ensureRail()
-  }, [authenticated, ensureRail])
+    void (async () => {
+      await ensureRail()
+      await refresh()
+    })()
+  }, [authenticated, ensureRail, refresh])
 
   useEffect(() => {
     if (!authenticated) return
-    refresh()
     const t = setInterval(refresh, 15_000)
     return () => clearInterval(t)
   }, [authenticated, refresh])
@@ -96,13 +117,22 @@ export default function App() {
         >
           {bootError ?? bootStatus}
           {bootError && (
-            <button
-              className="btn btn-quiet"
-              style={{ width: 'auto', padding: '6px 12px', marginTop: 8 }}
-              onClick={() => void ensureRail()}
-            >
-              Retry setup
-            </button>
+            <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+              <button
+                className="btn btn-quiet"
+                style={{ width: 'auto', padding: '6px 12px' }}
+                onClick={() => void ensureRail()}
+              >
+                Retry setup
+              </button>
+              <button
+                className="btn btn-primary"
+                style={{ width: 'auto', padding: '6px 12px' }}
+                onClick={() => setTab('fund')}
+              >
+                Add money
+              </button>
+            </div>
           )}
         </div>
       )}

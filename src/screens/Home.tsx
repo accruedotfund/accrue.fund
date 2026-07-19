@@ -4,6 +4,7 @@ import { RAILS, formatMoney, type CurrencyCode } from '../lib/rails'
 
 // Monitor surface: total first (biggest thing, top-left), then a dense
 // ledger of accounts. Rows, not cards; nothing centered.
+// USD is always open when status=live — never "Soon".
 
 export default function Home({
   holdings,
@@ -22,7 +23,10 @@ export default function Home({
     () => (holdings ?? []).filter((h) => h.balance > 0),
     [holdings],
   )
-  const usdOnly = funded.find((holding) => holding.rail.code === 'USD')?.balance
+  const usdHolding = useMemo(
+    () => (holdings ?? []).find((h) => h.rail.code === 'USD'),
+    [holdings],
+  )
 
   return (
     <div className="screen">
@@ -32,7 +36,7 @@ export default function Home({
           <div className="skeleton" style={{ height: 48, width: '70%' }} />
         ) : (
           <p className="display">
-            {usdOnly === undefined ? '—' : formatMoney('USD', usdOnly)}
+            {formatMoney('USD', usdHolding?.balance ?? 0)}
           </p>
         )}
         <p className="small muted">
@@ -69,14 +73,17 @@ export default function Home({
           <div className="ledger">
             {RAILS.map((rail) => {
               const h = holdings.find((x) => x.rail.code === rail.code)
-              const soon = rail.status === 'coming_soon' || !h
+              // Only non-USD rails (or status coming_soon) are "Soon".
+              const soon = rail.status === 'coming_soon'
+              const open = !soon
               return (
                 <button
                   key={rail.code}
                   className="row"
                   disabled={soon}
                   onClick={() => {
-                    if (!soon) onAccount(rail.code)
+                    if (open && h) onAccount(rail.code)
+                    else if (open) onFund()
                   }}
                 >
                   <span
@@ -97,22 +104,28 @@ export default function Home({
                     <span className="small muted">
                       {soon
                         ? 'Coming soon'
-                        : h!.boosted
-                          ? h!.boosts.some((b) => b.tier === 'growth')
-                            ? 'Growth Boost on · can fall hard'
-                            : 'Steady Boost on · can still move'
-                          : `standard value per unit ${h!.nav.toFixed(6)}`}
+                        : !h
+                          ? 'Open · add money to get started'
+                          : h.boosted
+                            ? h.boosts.some((b) => b.tier === 'growth')
+                              ? 'Growth Boost on · can fall hard'
+                              : 'Steady Boost on · can still move'
+                            : h.standardBalance > 0
+                              ? `standard value per unit ${h.nav.toFixed(6)}`
+                              : h.availableBalance > 0
+                                ? 'Available · ready to grow'
+                                : 'Open · add money to get started'}
                     </span>
                   </span>
                   {soon ? (
                     <span className="badge">Soon</span>
                   ) : (
                     <>
-                      {h!.boosted && <span className="badge boost">Boost</span>}
+                      {h?.boosted && <span className="badge boost">Boost</span>}
                       <span className="figure" style={{ fontSize: '1.05rem' }}>
-                        {h!.balance > 0
-                          ? formatMoney(rail.code, h!.balance)
-                          : '—'}
+                        {h && h.balance > 0
+                          ? formatMoney(rail.code, h.balance)
+                          : formatMoney(rail.code, 0)}
                       </span>
                     </>
                   )}
@@ -122,7 +135,7 @@ export default function Home({
           </div>
         )}
 
-        {holdings !== null && funded.length === 0 && (
+        {holdings !== null && (
           <div style={{ marginTop: 16 }}>
             <button className="btn btn-primary" onClick={onFund}>
               Add money

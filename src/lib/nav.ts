@@ -3,12 +3,22 @@
 // lower read is always RPC noise (stale node) — never render a down-tick.
 
 import { formatUnits, type Address } from 'viem'
-import { RAILS, isLive, type Rail } from './rails'
+import { RAILS, isOpen, isLive, type Rail } from './rails'
 import {
   fetchBoostPositions,
   type BoostPosition,
 } from './boost'
 import { publicClient } from './vault'
+
+const erc20Abi = [
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'a', type: 'address' }],
+    outputs: [{ type: 'uint256' }],
+  },
+] as const
 
 const wrapperAbi = [
   {
@@ -61,11 +71,10 @@ export async function fetchHoldings(
 ): Promise<Holding[]> {
   if (!owner) throw new Error('Embedded wallet is not ready')
 
-  const live = RAILS.filter(isLive)
-  // Empty during first-run wrapper create — App bootstraps, then refreshes.
-  if (live.length === 0) return []
+  // Open rails (USD) always appear — even before wUSDG is created.
+  const open = RAILS.filter(isOpen)
+  if (open.length === 0) return []
 
-  // Boost positions are USD-cash based today; load once, attach to USD rail.
   let boosts: BoostPosition[] = []
   try {
     boosts = await fetchBoostPositions(owner)
@@ -76,9 +85,40 @@ export async function fetchHoldings(
   const boostUnits = boosts.reduce((s, p) => s + p.lpUnits, 0n)
 
   const out: Holding[] = []
-  for (const rail of live) {
+  for (const rail of open) {
+    const railBoosts = rail.code === 'USD' ? boosts : []
+    const railBoostMark = rail.code === 'USD' ? boostMark : 0
+    const railBoostUnits = rail.code === 'USD' ? boostUnits : 0n
+
+    // Available USDG (or other stable) always readable.
+    const available = await publicClient.readContract({
+      address: rail.stable!,
+      abi: erc20Abi,
+      functionName: 'balanceOf',
+      args: [owner],
+    })
+    const availableBalance = Number(formatUnits(available, rail.decimals))
+
+    if (!isLive(rail)) {
+      // Dollar account open; standard vault not online yet.
+      out.push({
+        rail,
+        balance: availableBalance + railBoostMark,
+        availableBalance,
+        standardBalance: 0,
+        boostBalance: railBoostMark,
+        boosts: railBoosts,
+        nav: 1,
+        boosted: railBoostUnits > 0n,
+        assetUnits: available,
+        shareUnits: 0n,
+        boostUnits: railBoostUnits,
+      })
+      continue
+    }
+
     const one = 10n ** BigInt(rail.decimals)
-    const [assets, shares, available] = await Promise.all([
+    const [assets, shares] = await Promise.all([
       publicClient.readContract({
         address: rail.wrapper!,
         abi: wrapperAbi,
@@ -91,19 +131,9 @@ export async function fetchHoldings(
         functionName: 'balanceOf',
         args: [owner],
       }),
-      publicClient.readContract({
-        address: rail.stable!,
-        abi: wrapperAbi,
-        functionName: 'balanceOf',
-        args: [owner],
-      }),
     ])
     const nav = monotonic(rail.code, Number(formatUnits(assets, rail.decimals)))
     const standardBalance = Number(formatUnits(shares, rail.decimals)) * nav
-    const availableBalance = Number(formatUnits(available, rail.decimals))
-    const railBoosts = rail.code === 'USD' ? boosts : []
-    const railBoostMark = rail.code === 'USD' ? boostMark : 0
-    const railBoostUnits = rail.code === 'USD' ? boostUnits : 0n
 
     out.push({
       rail,

@@ -16,3 +16,4 @@ tsconfig.tsbuildinfo
 .DS_Store
 android/capacitor-cordova-android-plugins/
 .vercel
+.env.production
