@@ -130,7 +130,10 @@ Copy `.env.example` → **`.env` or `.env.local`** (gitignored — **never commi
 | Variable | Role |
 |----------|------|
 | `PRIVY_APP_SECRET` | Verify bearer tokens on `/api/accrue-offramp-session` |
-| `ACCRUE_OFFRAMP_URL` | Optional bank cashout HTTPS URL |
+| `CDP_API_KEY_ID` | Coinbase Developer **Secret** API key id |
+| `CDP_API_KEY_SECRET` | Coinbase Developer **Secret** private key |
+| `ACCRUE_OFFRAMP_REDIRECT_URL` | Post-sell redirect (default `https://accrue.fund`) |
+| `ACCRUE_OFFRAMP_URL` | Legacy generic bank URL (optional fallback) |
 
 ### Minimal web `.env`
 

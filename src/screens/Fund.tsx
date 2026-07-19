@@ -126,10 +126,19 @@ export default function Fund({
       }
 
       // —— withdraw ——
-      // Prefer bank partner session when backend is configured; otherwise
-      // settle via Relay to Base USDC at the same wallet address.
+      // 1) Always settle available USDG → Base USDC (same wallet) via Relay.
+      // 2) If API returns a Coinbase/bank URL, open cashout (USDC → bank).
+      await withdrawAvailableViaRelay({
+        rail,
+        owner: address,
+        amount,
+        send: sendTransaction,
+        progress: setStatus,
+      })
+      if (onRefresh) await onRefresh()
+
       if (API_BASE) {
-        setStatus('Starting bank withdrawal…')
+        setStatus('Opening secure cash out…')
         const accessToken = await getAccessToken()
         if (!accessToken) throw new Error('Your session has expired')
         const res = await fetch(`${API_BASE}/api/accrue-offramp-session`, {
@@ -150,18 +159,9 @@ export default function Fund({
             setDone(true)
             return
           }
-          // mode === 'relay' falls through to on-device path
         }
+        // mode === 'relay' or API miss: Base USDC already in wallet — done.
       }
-
-      await withdrawAvailableViaRelay({
-        rail,
-        owner: address,
-        amount,
-        send: sendTransaction,
-        progress: setStatus,
-      })
-      if (onRefresh) await onRefresh()
       setDone(true)
     } catch (err) {
       setError(humanError(err, direction))
@@ -181,7 +181,7 @@ export default function Fund({
           <p className="small" style={{ maxWidth: '34ch' }}>
             {direction === 'in'
               ? 'Finish the secure payment step. Your payment is then routed to your dollar account — usually within a few minutes.'
-              : 'Your available balance is on its way out. Bank arrival is typically 1–2 business days once the cashout partner settles.'}
+              : 'Your dollars are on Base first, then Coinbase (or your bank partner) for cash out. Bank arrival is typically 1–2 business days after you finish that step.'}
           </p>
           <button
             className="btn btn-quiet"
