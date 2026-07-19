@@ -154,7 +154,14 @@ export const RH_RPC_URLS: string[] = (() => {
 
 /** Primary URL (first in the fallback list). Prefer RH_RPC_URLS + fallback transport. */
 export const RPC_URL: string = RH_RPC_URLS[0]!
+/** Robinhood Chain mainnet — dollar account / USDG settlement. */
 export const CHAIN_ID = 4663
+/**
+ * Base mainnet — fiat onramp + Relay origin.
+ * Privy native gas sponsorship supports Base; it does NOT list Robinhood mainnet.
+ * Never use sponsor:true for CHAIN_ID (4663).
+ */
+export const BASE_CHAIN_ID = 8453
 
 /**
  * Backend that issues bank cashout sessions.

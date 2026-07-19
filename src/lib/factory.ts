@@ -48,8 +48,12 @@ export async function readUsdWrapper(): Promise<Address | undefined> {
 }
 
 /**
- * Ensure the canonical wUSDG vault exists. Permissionless: any sponsored
- * wallet may create it once; later callers just read wrapperOf.
+ * Ensure the canonical wUSDG vault exists. Permissionless create once.
+ *
+ * Prefer readUsdWrapper() on boot — do NOT auto-create. Privy native gas
+ * sponsorship does not cover Robinhood mainnet; create needs real RH ETH
+ * (or a future RH gas tank). Deposit path is Base → Relay → USDG and needs
+ * no vault create.
  */
 export async function ensureUsdWrapper(
   send: Sender,
@@ -61,6 +65,7 @@ export async function ensureUsdWrapper(
     throw new Error('Dollar rail factory is not configured')
   }
   progress('Opening your dollar account on the network…')
+  // RH txs: no Privy sponsor (see auth.tsx). Caller must have RH gas or fail.
   await sendAndWait(send, {
     to: WRAPPER_FACTORY,
     data: encodeFunctionData({

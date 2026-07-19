@@ -3,6 +3,10 @@
 // App ID is public. Mobile client ID (client-…) is public too when using
 // Capacitor. NEVER put PRIVY_APP_SECRET in VITE_* — it would ship in the
 // browser bundle. Web works with appId alone; mobile needs clientId.
+//
+// Gas: Privy App-pays sponsorship works on Base (and listed chains). Robinhood
+// mainnet (4663) is NOT in Privy’s sponsored set — only “Robinhood Testnet”.
+// Deposit path = Coinbase/Base → Relay → RH. Never pass sponsor:true on 4663.
 
 import {
   createContext,
@@ -17,9 +21,10 @@ import {
   useWallets,
   type ConnectedWallet,
 } from '@privy-io/react-auth'
+import { base } from 'viem/chains'
 import { defineChain, type Hash } from 'viem'
 import type { Address } from 'viem'
-import { CHAIN_ID, RH_RPC_URLS, RPC_URL } from './rails'
+import { BASE_CHAIN_ID, CHAIN_ID, RH_RPC_URLS, RPC_URL } from './rails'
 
 const PRIVY_APP_ID = (import.meta.env.VITE_PRIVY_APP_ID as string | undefined)?.trim()
 const rawClientId = (import.meta.env.VITE_PRIVY_CLIENT_ID as string | undefined)?.trim()
@@ -68,6 +73,8 @@ export interface TransactionRequest {
   to: Address
   data?: `0x${string}`
   value?: bigint
+  /** Defaults to Robinhood (4663). Use BASE_CHAIN_ID for Base-only ops. */
+  chainId?: number
 }
 
 export interface Session {
@@ -90,6 +97,23 @@ export function useAuth(): Session {
   return s
 }
 
+function humanSendError(err: unknown, chainId: number): Error {
+  const msg = err instanceof Error ? err.message : String(err ?? '')
+  if (/app secret is required|gas sponsored/i.test(msg)) {
+    return new Error(
+      chainId === CHAIN_ID
+        ? 'Network fees on Robinhood are not covered by Privy sponsorship. Add money uses Base → Relay (no RH gas). Standard growth / withdraw need a tiny RH network fee — we’re not creating vaults with broken sponsorship.'
+        : 'Gas sponsorship failed on this network. Try again, or check Privy App pays + client allow for Base.',
+    )
+  }
+  if (/insufficient funds|gas required|intrinsic gas/i.test(msg)) {
+    return new Error(
+      'Not enough network fee on this chain. Deposits still work via Base → Relay.',
+    )
+  }
+  return err instanceof Error ? err : new Error(msg || 'Transaction failed')
+}
+
 function PrivyBridge({ children }: { children: ReactNode }) {
   const { ready, authenticated, user, getAccessToken, login, logout } = usePrivy()
   const { ready: walletsReady, wallets } = useWallets()
@@ -107,20 +131,29 @@ function PrivyBridge({ children }: { children: ReactNode }) {
   const sendTransaction = useMemo(
     () => async (tx: TransactionRequest): Promise<Hash> => {
       if (!embeddedWallet) throw new Error('Your account is not ready.')
-      await embeddedWallet.switchChain(CHAIN_ID)
-      const result = await sendPrivyTransaction(
-        {
-          to: tx.to,
-          data: tx.data,
-          value: tx.value,
-        },
-        {
-          address: embeddedWallet.address,
-          sponsor: true,
-          uiOptions: { showWalletUIs: false },
-        },
-      )
-      return result.hash as Hash
+      const chainId = tx.chainId ?? CHAIN_ID
+      // Privy native sponsorship: Base yes · Robinhood mainnet no (docs list
+      // only Robinhood Testnet). sponsor:true on 4663 → "App secret required".
+      const sponsor = chainId === BASE_CHAIN_ID
+      try {
+        await embeddedWallet.switchChain(chainId)
+        const result = await sendPrivyTransaction(
+          {
+            to: tx.to,
+            data: tx.data,
+            value: tx.value,
+            chainId,
+          },
+          {
+            address: embeddedWallet.address,
+            sponsor,
+            uiOptions: { showWalletUIs: false },
+          },
+        )
+        return result.hash as Hash
+      } catch (err) {
+        throw humanSendError(err, chainId)
+      }
     },
     [embeddedWallet, sendPrivyTransaction],
   )
@@ -180,7 +213,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         embeddedWallets: {
           ethereum: { createOnLogin: 'users-without-wallets' },
         },
-        supportedChains: [robinhoodChain],
+        // Base for Coinbase/onramp + Relay origin; RH for USDG settlement.
+        supportedChains: [base, robinhoodChain],
         defaultChain: robinhoodChain,
         customOAuthRedirectUrl: 'accrue://auth',
         appearance: {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useAuth } from './lib/auth'
-import { ensureUsdWrapper, readUsdWrapper } from './lib/factory'
+import { readUsdWrapper } from './lib/factory'
 import { fetchHoldings, type Holding } from './lib/nav'
 import { setRailWrapper, type CurrencyCode } from './lib/rails'
 import Home from './screens/Home'
@@ -20,51 +20,28 @@ const TABS: { id: Tab; label: string; glyph: string }[] = [
 ]
 
 export default function App() {
-  const { ready, authenticated, address, walletReady, sendTransaction } =
-    useAuth()
+  const { ready, authenticated, address, walletReady } = useAuth()
   const [tab, setTab] = useState<Tab>('home')
   const [holdings, setHoldings] = useState<Holding[] | null>(null)
   const [loadError, setLoadError] = useState(false)
   const [selectedCode, setSelectedCode] = useState<string | null>(null)
-  const [bootStatus, setBootStatus] = useState<string | null>(null)
-  const [bootError, setBootError] = useState<string | null>(null)
-
-  const humanBootError = (err: unknown): string => {
-    const msg = err instanceof Error ? err.message : String(err ?? '')
-    if (/app secret is required/i.test(msg) || /gas sponsored/i.test(msg)) {
-      return 'Network fees for setup need Privy gas sponsorship: App pays + Robinhood Chain + “Allow transactions from the client”. You can still add money; Standard growth unlocks after that.'
-    }
-    if (/sponsor|gas sponsorship/i.test(msg)) {
-      return 'Gas sponsorship is not ready yet. You can still add money — Standard account setup will finish once sponsorship is on.'
-    }
-    return msg || 'Could not finish account setup. You can still add money.'
-  }
-
+  // Deposit path = Base (Coinbase) → Relay → RH. Privy does not sponsor RH
+  // mainnet gas — never create wUSDG on boot with sponsor:true.
   const ensureRail = useCallback(async () => {
     if (!walletReady || !address) return
-    setBootError(null)
     try {
-      // Always discover existing wrapper (no gas needed).
-      let wrapper = await readUsdWrapper()
+      const wrapper = await readUsdWrapper()
       if (wrapper) {
         setRailWrapper('USD', wrapper)
-        setBootStatus(null)
-        return
       }
-      // Create requires sponsored gas — may fail until Privy is configured.
-      setBootStatus('Opening standard dollar growth…')
-      wrapper = await ensureUsdWrapper(sendTransaction, setBootStatus)
-      setRailWrapper('USD', wrapper)
-      setBootStatus(null)
-    } catch (err) {
-      setBootStatus(null)
-      setBootError(humanBootError(err))
+      // If no wrapper yet: still open for Add money (available USDG via Relay).
+    } catch {
+      /* RPC noise — balances may still load */
     }
-  }, [walletReady, address, sendTransaction])
+  }, [walletReady, address])
 
   const refresh = useCallback(async () => {
     try {
-      // Prefer on-chain wrapper discovery even if create failed.
       try {
         const w = await readUsdWrapper()
         if (w) setRailWrapper('USD', w)
@@ -109,33 +86,6 @@ export default function App() {
 
   return (
     <div className="frame">
-      {(bootStatus || bootError) && (
-        <div
-          className="notice"
-          role={bootError ? 'alert' : 'status'}
-          style={{ margin: '12px 16px 0' }}
-        >
-          {bootError ?? bootStatus}
-          {bootError && (
-            <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-              <button
-                className="btn btn-quiet"
-                style={{ width: 'auto', padding: '6px 12px' }}
-                onClick={() => void ensureRail()}
-              >
-                Retry setup
-              </button>
-              <button
-                className="btn btn-primary"
-                style={{ width: 'auto', padding: '6px 12px' }}
-                onClick={() => setTab('fund')}
-              >
-                Add money
-              </button>
-            </div>
-          )}
-        </div>
-      )}
       {selected ? (
         <Account
           holding={selected}
