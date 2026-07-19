@@ -52,8 +52,9 @@ export async function ensureRhGas({
 
   const onBase = await baseEthBalance(owner)
   if (onBase < BRIDGE_WEI) {
+    // Include the full address — users need somewhere to send Base ETH.
     throw new Error(
-      'Not enough network fee on Robinhood, and not enough Base ETH to top it up automatically. Add a little ETH on Base (same address), then try again. Your dollars are safe.',
+      `GAS_TOPUP_NEEDED:${owner}:Send a little ETH on Base to your Accrue address, then try again. Network fee is separate from your dollars (which are safe).`,
     )
   }
 

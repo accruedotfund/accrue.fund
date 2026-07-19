@@ -6,21 +6,67 @@ import type { Holding } from '../lib/nav'
 import { formatMoney, setRailWrapper } from '../lib/rails'
 import { depositAvailable, redeemStandard } from '../lib/vault'
 
+type GasHint = {
+  address: string
+  detail: string
+}
+
+function parseGasHint(
+  cause: unknown,
+  fallbackAddress?: string,
+): GasHint | null {
+  const msg = cause instanceof Error ? cause.message : String(cause ?? '')
+  const tagged = msg.match(/^GAS_TOPUP_NEEDED:(0x[a-fA-F0-9]{40}):([\s\S]+)$/)
+  if (tagged) {
+    return { address: tagged[1]!, detail: tagged[2]!.trim() }
+  }
+  if (
+    /Base ETH|network fee|top-up|top up|Robinhood|insufficient funds|gas required|intrinsic gas/i.test(
+      msg,
+    )
+  ) {
+    if (fallbackAddress) {
+      return {
+        address: fallbackAddress,
+        detail:
+          msg.replace(/^GAS_TOPUP_NEEDED:[^:]+:/, '').trim() ||
+          'Send a little ETH on Base to this address, then try again.',
+      }
+    }
+  }
+  return null
+}
+
 function humanMoveError(cause: unknown): string {
   const msg = cause instanceof Error ? cause.message : String(cause ?? '')
-  if (/Base ETH|network fee|top-up|top up|Robinhood/i.test(msg) && /safe|try again|settling/i.test(msg)) {
+  if (msg.startsWith('GAS_TOPUP_NEEDED:')) {
+    return msg.replace(/^GAS_TOPUP_NEEDED:0x[a-fA-F0-9]{40}:/, '').trim()
+  }
+  if (
+    /Base ETH|network fee|top-up|top up|Robinhood/i.test(msg) &&
+    /safe|try again|settling/i.test(msg)
+  ) {
     return msg
   }
-  if (/insufficient funds|gas required|intrinsic gas|out of gas|network fee on this chain/i.test(msg)) {
-    return 'Robinhood needs a tiny network fee. If you have ETH on Base (same address), we’ll move a scrap over automatically — tap again. Your dollars stay safe.'
+  if (
+    /insufficient funds|gas required|intrinsic gas|out of gas|network fee on this chain/i.test(
+      msg,
+    )
+  ) {
+    return 'Robinhood needs a tiny network fee. Send a little ETH on Base to your address below — we’ll move it over automatically.'
   }
   if (/app secret|gas sponsored|sponsor/i.test(msg)) {
-    return 'Network fee couldn’t be sponsored on Robinhood. We’ll top up from Base ETH when you retry. Your available balance is untouched.'
+    return 'Network fee couldn’t be sponsored on Robinhood. Send a little ETH on Base to your address, then retry.'
   }
   if (/not configured|not open/i.test(msg)) {
     return 'Standard growth isn’t open yet — we’ll open it when you move balance (uses a tiny network fee).'
   }
   return msg || 'The balance did not move. Nothing was lost.'
+}
+
+function shorten(addr: string): string {
+  if (addr.length < 12) return addr
+  return `${addr.slice(0, 6)}…${addr.slice(-4)}`
 }
 
 export default function Account({
@@ -35,11 +81,12 @@ export default function Account({
   const { address, walletReady, sendTransaction } = useAuth()
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [gasHint, setGasHint] = useState<GasHint | null>(null)
+  const [copied, setCopied] = useState(false)
 
   const needsVaultOpen = holding.rail.code === 'USD' && !holding.rail.wrapper
 
   async function ensureStandardVault() {
-    // Discover existing wUSDG, or permissionless-create once (user pays RH gas).
     let wrapper = await readUsdWrapper()
     if (!wrapper) {
       setBusy('Opening standard growth on the network…')
@@ -50,15 +97,26 @@ export default function Account({
     return wrapper
   }
 
+  async function copyAddress(addr: string) {
+    try {
+      await navigator.clipboard.writeText(addr)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      /* ignore */
+    }
+  }
+
   async function move(direction: 'grow' | 'available') {
     if (!address || !walletReady) {
       setError('Your account is not ready yet.')
+      setGasHint(null)
       return
     }
     setError(null)
+    setGasHint(null)
     setBusy('Preparing…')
     try {
-      // Base ETH ≠ RH ETH. Top up RH gas from Base via Relay when needed.
       await ensureRhGas({
         owner: address,
         send: sendTransaction,
@@ -76,6 +134,7 @@ export default function Account({
       await onRefresh()
     } catch (cause) {
       setError(humanMoveError(cause))
+      setGasHint(parseGasHint(cause, address))
     } finally {
       setBusy(null)
     }
@@ -137,7 +196,49 @@ export default function Account({
 
       {error && (
         <div className="notice" role="alert">
-          {error}
+          <p style={{ margin: 0 }}>{error}</p>
+          {gasHint && (
+            <div style={{ marginTop: 12 }}>
+              <p className="small muted" style={{ margin: '0 0 6px' }}>
+                Your Accrue address — send a little <strong>ETH on Base</strong>{' '}
+                here:
+              </p>
+              <div
+                style={{
+                  display: 'flex',
+                  gap: 8,
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                }}
+              >
+                <code
+                  className="figure"
+                  style={{
+                    fontSize: '0.85rem',
+                    wordBreak: 'break-all',
+                    flex: 1,
+                    minWidth: 0,
+                  }}
+                  title={gasHint.address}
+                >
+                  {gasHint.address}
+                </code>
+                <button
+                  type="button"
+                  className="btn btn-quiet"
+                  style={{ width: 'auto', padding: '8px 12px', flexShrink: 0 }}
+                  onClick={() => void copyAddress(gasHint.address)}
+                >
+                  {copied ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+              <p className="small muted" style={{ margin: '8px 0 0' }}>
+                Network: <strong>Base</strong> · not Ethereum mainnet · not
+                Robinhood. After it lands, tap the button again (
+                {shorten(gasHint.address)}).
+              </p>
+            </div>
+          )}
         </div>
       )}
 
@@ -165,8 +266,8 @@ export default function Account({
 
       <p className="small muted">
         {needsVaultOpen
-          ? 'Standard growth opens once. If you only have ETH on Base, we’ll move a tiny network fee over automatically, then open growth and deposit.'
-          : 'A small entry or exit charge stays in the standard account and increases value per unit for everyone who remains. Network fees use Robinhood ETH (auto-topped from Base when needed).'}
+          ? 'Standard growth opens once. Network fee uses a scrap of ETH — we’ll pull it from Base to Robinhood when you have some.'
+          : 'A small entry or exit charge stays in the standard account and increases value per unit for everyone who remains.'}
       </p>
     </div>
   )
