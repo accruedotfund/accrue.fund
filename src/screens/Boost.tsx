@@ -7,6 +7,7 @@ import {
   resolveSteadyPool,
   type BoostPosition,
 } from '../lib/boost'
+import { hasNetworkFeeReady } from '../lib/gasBridge'
 import type { Holding } from '../lib/nav'
 import { formatMoney } from '../lib/rails'
 import { STRATEGIES, type BoostStrategy, type BoostTier } from '../lib/strategies'
@@ -17,6 +18,75 @@ import { STRATEGIES, type BoostStrategy, type BoostTier } from '../lib/strategie
 function isGasError(msg: string): boolean {
   return /Base ETH|network fee|top-up|top up|Robinhood|insufficient funds|gas required|intrinsic gas|sponsor|Accrue address|ETH on Base/i.test(
     msg,
+  )
+}
+
+function AddressFundCard({
+  address,
+  title,
+  detail,
+}: {
+  address: string
+  title?: string
+  detail?: string
+}) {
+  const [copied, setCopied] = useState(false)
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(address)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      /* ignore */
+    }
+  }
+  return (
+    <div style={{ marginTop: title || detail ? 0 : 12 }}>
+      {title && (
+        <p style={{ margin: '0 0 8px', fontWeight: 600 }}>{title}</p>
+      )}
+      {detail && (
+        <p className="small muted" style={{ margin: '0 0 10px' }}>
+          {detail}
+        </p>
+      )}
+      <p className="small muted" style={{ margin: '0 0 6px' }}>
+        Your Accrue address — send a little <strong>ETH on Base</strong> here:
+      </p>
+      <div
+        style={{
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+          flexWrap: 'wrap',
+        }}
+      >
+        <code
+          className="figure"
+          style={{
+            fontSize: '0.85rem',
+            wordBreak: 'break-all',
+            flex: 1,
+            minWidth: 0,
+          }}
+          title={address}
+        >
+          {address}
+        </code>
+        <button
+          type="button"
+          className="btn btn-quiet"
+          style={{ width: 'auto', padding: '8px 12px', flexShrink: 0 }}
+          onClick={() => void copy()}
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      <p className="small muted" style={{ margin: '8px 0 0' }}>
+        Network: <strong>Base</strong> · not Ethereum mainnet · not Robinhood.
+        About $0.30–1 is enough. After it lands, turn Steady on again.
+      </p>
+    </div>
   )
 }
 
@@ -33,7 +103,7 @@ export default function Boost({
   const [status, setStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [gasAddress, setGasAddress] = useState<string | null>(null)
-  const [copied, setCopied] = useState(false)
+  const [feeReady, setFeeReady] = useState<boolean | null>(null)
   const [steadyOpen, setSteadyOpen] = useState<boolean | null>(null)
   const [growthOpen, setGrowthOpen] = useState<boolean | null>(null)
 
@@ -65,18 +135,28 @@ export default function Boost({
     }
   }, [holdings])
 
+  // Proactive: show fund-address card before they hit Turn on and fail.
+  useEffect(() => {
+    if (!address || !walletReady) {
+      setFeeReady(null)
+      return
+    }
+    let cancelled = false
+    ;(async () => {
+      try {
+        const ok = await hasNetworkFeeReady(address)
+        if (!cancelled) setFeeReady(ok)
+      } catch {
+        if (!cancelled) setFeeReady(null)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [address, walletReady, holdings])
+
   function positionFor(tier: BoostTier): BoostPosition | undefined {
     return positions.find((p) => p.tier === tier)
-  }
-
-  async function copyGasAddress(addr: string) {
-    try {
-      await navigator.clipboard.writeText(addr)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    } catch {
-      /* ignore */
-    }
   }
 
   async function change(strategy: BoostStrategy, on: boolean) {
@@ -98,23 +178,27 @@ export default function Boost({
       }
       setStatus('Updating your balance…')
       await onRefresh()
+      try {
+        setFeeReady(await hasNetworkFeeReady(address))
+      } catch {
+        /* ignore */
+      }
     } catch (cause) {
       const raw =
         cause instanceof Error
           ? cause.message
           : 'Boost did not change. Your existing balance is untouched.'
-      // Uniswap reverts are unreadable — surface the human copy we throw above.
       let msg = /INSUFFICIENT_[AB]_AMOUNT/i.test(raw)
         ? 'Boost liquidity slipped (pool too thin or price moved). Try again or keep funds in Standard.'
         : raw
 
-      // ensureRhGas tags: GAS_TOPUP_NEEDED:0xaddr:detail
       const tagged = msg.match(
         /^GAS_TOPUP_NEEDED:(0x[a-fA-F0-9]{40}):([\s\S]+)$/,
       )
       if (tagged) {
         msg = tagged[2]!.trim()
         setGasAddress(tagged[1]!)
+        setFeeReady(false)
       } else if (isGasError(msg)) {
         if (
           /insufficient funds|gas required|intrinsic gas|network fee|sponsor/i.test(
@@ -126,6 +210,7 @@ export default function Boost({
             'Need a little ETH on Base for network fees (~$0.30+). Send it to the address below, then try Steady again. Your dollars are safe.'
         }
         setGasAddress(address)
+        setFeeReady(false)
       } else {
         setGasAddress(null)
       }
@@ -136,6 +221,9 @@ export default function Boost({
     }
   }
 
+  const showFundUpFront =
+    Boolean(address) && feeReady === false && !error
+
   return (
     <div className="screen">
       <header>
@@ -145,6 +233,16 @@ export default function Boost({
           not a market, token, or pool.
         </p>
       </header>
+
+      {showFundUpFront && address && (
+        <div className="notice" role="status">
+          <AddressFundCard
+            address={address}
+            title="Network fee needed first"
+            detail="Steady runs on Robinhood Chain. We move a scrap of ETH from Base for fees. Fund Base once, then turn Steady on."
+          />
+        </div>
+      )}
 
       {holdings === null ? (
         <div className="skeleton" style={{ height: 140 }} />
@@ -241,47 +339,7 @@ export default function Boost({
       {error && (
         <div className="notice" role="alert">
           <p style={{ margin: 0 }}>{error}</p>
-          {gasAddress && (
-            <div style={{ marginTop: 12 }}>
-              <p className="small muted" style={{ margin: '0 0 6px' }}>
-                Your Accrue address — send a little <strong>ETH on Base</strong>{' '}
-                here:
-              </p>
-              <div
-                style={{
-                  display: 'flex',
-                  gap: 8,
-                  alignItems: 'center',
-                  flexWrap: 'wrap',
-                }}
-              >
-                <code
-                  className="figure"
-                  style={{
-                    fontSize: '0.85rem',
-                    wordBreak: 'break-all',
-                    flex: 1,
-                    minWidth: 0,
-                  }}
-                  title={gasAddress}
-                >
-                  {gasAddress}
-                </code>
-                <button
-                  type="button"
-                  className="btn btn-quiet"
-                  style={{ width: 'auto', padding: '8px 12px', flexShrink: 0 }}
-                  onClick={() => void copyGasAddress(gasAddress)}
-                >
-                  {copied ? 'Copied' : 'Copy'}
-                </button>
-              </div>
-              <p className="small muted" style={{ margin: '8px 0 0' }}>
-                Network: <strong>Base</strong> · not Ethereum mainnet · not
-                Robinhood. After it lands, turn Steady on again.
-              </p>
-            </div>
-          )}
+          {gasAddress && <AddressFundCard address={gasAddress} />}
         </div>
       )}
 

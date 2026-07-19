@@ -45,6 +45,14 @@ export async function baseEthBalance(owner: Address): Promise<bigint> {
   return baseClient.getBalance({ address: owner })
 }
 
+/** True when wallet can pay RH fees already, or has enough Base ETH to bridge. */
+export async function hasNetworkFeeReady(owner: Address): Promise<boolean> {
+  const rh = await rhEthBalance(owner)
+  if (rh >= MIN_RH_WEI) return true
+  const onBase = await baseEthBalance(owner)
+  return onBase >= MIN_BRIDGE_WEI
+}
+
 function fmtEth(wei: bigint): string {
   const s = formatEther(wei)
   const n = Number(s)
@@ -77,7 +85,7 @@ export async function ensureRhGas({
 
   if (onBase < MIN_BRIDGE_WEI) {
     throw new Error(
-      `GAS_TOPUP_NEEDED:${owner}:You have ${fmtEth(onBase)} ETH on Base — need at least ~${fmtEth(MIN_BRIDGE_WEI)} ETH on Base (about $0.30+) to open standard growth. Send ETH on Base to the address below, then try again. Your dollars are safe.`,
+      `GAS_TOPUP_NEEDED:${owner}:You have ${fmtEth(onBase)} ETH on Base — need at least ~${fmtEth(MIN_BRIDGE_WEI)} ETH on Base (about $0.30+) for network fees. Send ETH on Base to the address below, then try again. Your dollars are safe.`,
     )
   }
 
