@@ -151,7 +151,8 @@ export async function ensureRhGas({
     throw new Error('Could not prepare network-fee top-up route.')
   }
 
-  // Prefer sponsored gas (client → server PRIVY_APP_SECRET → self-pay fallback).
+  // Self-pay Base gas (needs a scrap of ETH on Base). Client sponsor is best-effort
+  // inside sendTransaction; server sponsor is disabled for embedded wallets.
   const hash = await send({
     to: depositAddress,
     value,

@@ -3,12 +3,13 @@
 // App ID is public. Mobile client ID (client-…) is public too when using
 // Capacitor. NEVER put PRIVY_APP_SECRET in VITE_* — it ships in the browser.
 //
-// Gas sponsorship (App pays):
-// 1) Client sponsor:true when Privy allows it
-// 2) Else POST /api/accrue-sponsor-tx with server PRIVY_APP_SECRET
-// 3) Else self-pay (user ETH on that chain)
-// Robinhood mainnet may still fail sponsorship if not on Privy’s list — then
-// we top up RH ETH from Base via Relay (gasBridge).
+// Gas:
+// 1) Base only: try Privy client sponsor:true (dashboard “allow from client”)
+// 2) Else self-pay with user’s ETH on that chain
+// Server /api/accrue-sponsor-tx is intentionally NOT used for embedded wallets:
+// Privy wallet RPC needs a user authorization signature; JWT exchange rejects
+// the browser access token in this app setup (“Invalid JWT token provided”).
+// Robinhood (4663) is never sponsored — ensureRhGas bridges Base ETH → RH.
 
 import {
   createContext,
@@ -22,12 +23,11 @@ import {
   useSendTransaction,
   useWallets,
   type ConnectedWallet,
-  type User,
 } from '@privy-io/react-auth'
 import { base } from 'viem/chains'
 import { defineChain, type Hash } from 'viem'
 import type { Address } from 'viem'
-import { API_BASE, BASE_CHAIN_ID, CHAIN_ID, RH_RPC_URLS, RPC_URL } from './rails'
+import { BASE_CHAIN_ID, CHAIN_ID, RH_RPC_URLS, RPC_URL } from './rails'
 
 const PRIVY_APP_ID = (import.meta.env.VITE_PRIVY_APP_ID as string | undefined)?.trim()
 const rawClientId = (import.meta.env.VITE_PRIVY_CLIENT_ID as string | undefined)?.trim()
@@ -103,97 +103,21 @@ export function useAuth(): Session {
   return s
 }
 
-function walletIdForAddress(
-  user: User | null | undefined,
-  address: string,
-): string | undefined {
-  const want = address.toLowerCase()
-  for (const a of user?.linkedAccounts ?? []) {
-    if (a.type !== 'wallet') continue
-    const w = a as { id?: string; address?: string }
-    if (w.address?.toLowerCase() === want && w.id) return w.id
-  }
-  return undefined
-}
-
 function humanSendError(err: unknown, chainId: number): Error {
   const msg = err instanceof Error ? err.message : String(err ?? '')
-  if (
-    /privy-authorization-signature|authorization signature|missing_or_empty_authorization/i.test(
-      msg,
-    )
-  ) {
-    return new Error(
-      'Network fee sponsorship is misconfigured (wallet auth signature). Retry in a moment, or keep a little ETH on Base for gas.',
-    )
-  }
   if (/app secret is required|gas sponsored|PRIVY_APP_SECRET/i.test(msg)) {
     return new Error(
-      chainId === CHAIN_ID
-        ? 'Could not sponsor network fees on Robinhood. We can top up from Base ETH — try again. Your dollars are safe.'
-        : 'Could not sponsor network fees. Set PRIVY_APP_SECRET on the server, or keep a little ETH on Base for gas.',
-    )
-  }
-  // Privy does not list Robinhood mainnet for app-pays gas — expect this often.
-  if (
-    chainId === CHAIN_ID &&
-    /not supported|unsupported chain|chain.*(not|unsupported)|sponsorship.*(not|unavailable|disabled)/i.test(
-      msg,
-    )
-  ) {
-    return new Error(
-      'Robinhood network fees can’t be sponsored. If you have ETH on Base, retry — we’ll move a tiny fee over. Your dollars are safe.',
+      'Keep a little ETH on Base for network fees (~$0.30+), then retry. Your dollars are safe.',
     )
   }
   if (/insufficient funds|gas required|intrinsic gas/i.test(msg)) {
     return new Error(
       chainId === CHAIN_ID
-        ? 'Not enough Robinhood network fee. If you have ETH on Base, retry — we’ll move a tiny fee over. Deposits never need RH ETH.'
-        : 'Not enough ETH on Base for this step (value + gas). Top up Base ETH and try again.',
+        ? 'Not enough Robinhood network fee. If you have ETH on Base, retry — we’ll move a tiny fee over. Your dollars are safe.'
+        : 'Not enough ETH on Base for this step (value + gas). Send ~$1 of ETH on Base to your Accrue address, then try again.',
     )
   }
   return err instanceof Error ? err : new Error(msg || 'Transaction failed')
-}
-
-async function sendSponsoredOnServer(opts: {
-  walletId: string
-  chainId: number
-  tx: TransactionRequest
-  getAccessToken: () => Promise<string | null>
-}): Promise<Hash> {
-  const accessToken = await opts.getAccessToken()
-  if (!accessToken) throw new Error('Your session has expired')
-
-  const origin =
-    API_BASE ||
-    (typeof window !== 'undefined' ? window.location.origin : '')
-  if (!origin) throw new Error('API origin not configured for sponsorship')
-
-  const res = await fetch(`${origin}/api/accrue-sponsor-tx`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify({
-      walletId: opts.walletId,
-      caip2: `eip155:${opts.chainId}`,
-      transaction: {
-        to: opts.tx.to,
-        data: opts.tx.data,
-        value:
-          opts.tx.value != null ? opts.tx.value.toString() : undefined,
-      },
-    }),
-  })
-  const body = (await res.json().catch(() => ({}))) as {
-    hash?: string
-    error?: string
-  }
-  if (!res.ok || !body.hash || !/^0x[a-fA-F0-9]{64}$/.test(body.hash)) {
-    throw new Error(body.error || `Sponsored send failed (${res.status})`)
-  }
-  return body.hash as Hash
 }
 
 function PrivyBridge({ children }: { children: ReactNode }) {
@@ -215,8 +139,8 @@ function PrivyBridge({ children }: { children: ReactNode }) {
     () => async (tx: TransactionRequest): Promise<Hash> => {
       if (!embeddedWallet) throw new Error('Your account is not ready.')
       const chainId = tx.chainId ?? CHAIN_ID
-      // Privy app-pays lists Base, not Robinhood mainnet (4663). Only sponsor Base.
-      const wantSponsor =
+      // Only attempt client sponsorship on Base (Privy-supported app-pays chain).
+      const wantClientSponsor =
         tx.sponsor !== false && chainId === BASE_CHAIN_ID
 
       const sendClient = async (useSponsor: boolean) => {
@@ -236,58 +160,33 @@ function PrivyBridge({ children }: { children: ReactNode }) {
         )
       }
 
-      const walletId = walletIdForAddress(user, embeddedWallet.address)
-
-      // 1) Client-sponsored on Base when Privy allows it
-      if (wantSponsor) {
+      // 1) Client-sponsored Base when dashboard allows it
+      if (wantClientSponsor) {
         try {
           const result = await sendClient(true)
           return result.hash as Hash
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err ?? '')
-          if (!/app secret is required|gas sponsored|invalid_data/i.test(msg)) {
-            // Non-sponsor error (user reject, etc.) — don't mask
-            if (!/sponsor|app secret/i.test(msg)) throw humanSendError(err, chainId)
+          // Fall through to self-pay when sponsorship is disabled / needs app secret
+          if (
+            !/app secret is required|gas sponsored|sponsor|invalid_data/i.test(
+              msg,
+            )
+          ) {
+            throw humanSendError(err, chainId)
           }
-          // fall through to server sponsor
         }
       }
 
-      // 2) Server-sponsored Base only: PRIVY_APP_SECRET + user JWT auth signature
-      let sponsorErr: unknown
-      if (wantSponsor && walletId) {
-        try {
-          return await sendSponsoredOnServer({
-            walletId,
-            chainId,
-            tx,
-            getAccessToken,
-          })
-        } catch (err) {
-          sponsorErr = err
-          // fall through to self-pay (needs Base ETH)
-        }
-      }
-
-      // 3) Self-pay (RH Steady/createPair path — needs RH ETH via ensureRhGas)
+      // 2) Self-pay — Base gas bridge + all RH Steady txs after ensureRhGas
       try {
         const result = await sendClient(false)
         return result.hash as Hash
       } catch (err) {
-        // Prefer the clearer sponsor failure when self-pay is just "no gas".
-        const selfMsg = err instanceof Error ? err.message : String(err ?? '')
-        if (
-          sponsorErr &&
-          /insufficient funds|gas required|intrinsic gas|app secret|sponsor|authorization/i.test(
-            selfMsg,
-          )
-        ) {
-          throw humanSendError(sponsorErr, chainId)
-        }
         throw humanSendError(err, chainId)
       }
     },
-    [embeddedWallet, sendPrivyTransaction, user, getAccessToken],
+    [embeddedWallet, sendPrivyTransaction],
   )
 
   const value = useMemo<Session>(
