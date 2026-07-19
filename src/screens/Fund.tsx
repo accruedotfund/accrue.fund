@@ -17,14 +17,42 @@ import {
   type CurrencyCode,
 } from '../lib/rails'
 
-// Configure surface: pick direction, currency, amount → review → pay/send.
-// In: Privy → Coinbase card onramp (preferred) → Base USDC at Relay deposit
-//     address → Relay fills USDG on Robinhood. Prefer Coinbase so MoonPay’s
-//     geo dead-end is not the default handoff.
+// Configure surface: pick direction, currency, amount → review → how to pay → send.
+// In: user chooses payment partner → Base USDC at Relay deposit → Relay → RH USDG.
+// Never force Coinbase — many users have no Coinbase account.
 // Out: available USDG → Relay → Base USDC; optional bank URL via API_BASE.
 
 type Direction = 'in' | 'out'
+/** How the user funds the Base USDC deposit leg. */
+type PayMethod = 'card' | 'coinbase' | 'moonpay' | 'choose'
 const PRESETS = [50, 200, 1000]
+
+const PAY_METHODS: {
+  id: PayMethod
+  label: string
+  blurb: string
+}[] = [
+  {
+    id: 'card',
+    label: 'Card or bank',
+    blurb: 'Debit, credit, or bank — no Coinbase account needed.',
+  },
+  {
+    id: 'coinbase',
+    label: 'Coinbase',
+    blurb: 'If you already use Coinbase (account or onramp).',
+  },
+  {
+    id: 'moonpay',
+    label: 'MoonPay',
+    blurb: 'Another card partner. May not be available in every region.',
+  },
+  {
+    id: 'choose',
+    label: 'Show all options',
+    blurb: 'Open the full payment menu and pick there.',
+  },
+]
 
 function humanError(err: unknown, direction: Direction): string {
   const msg = err instanceof Error ? err.message : ''
@@ -64,6 +92,8 @@ export default function Fund({
   const [depositRoute, setDepositRoute] = useState<RelayDepositRoute | null>(
     null,
   )
+  /** Default card/bank — not Coinbase (no account required). */
+  const [payMethod, setPayMethod] = useState<PayMethod>('card')
 
   const value = parseFloat(amount)
   const rail = RAILS.find((item) => item.code === currency)!
@@ -89,6 +119,34 @@ export default function Fund({
     setError(null)
   }
 
+  function fundOptionsFor(method: PayMethod) {
+    const baseOpts = {
+      chain: base,
+      amount: String(value),
+      asset: 'USDC' as const,
+    }
+    switch (method) {
+      case 'card':
+        // Card/bank without locking Coinbase — user need not have a CB account.
+        return { ...baseOpts, defaultFundingMethod: 'card' as const }
+      case 'coinbase':
+        return {
+          ...baseOpts,
+          defaultFundingMethod: 'exchange' as const,
+          card: { preferredProvider: 'coinbase' as const },
+        }
+      case 'moonpay':
+        return {
+          ...baseOpts,
+          defaultFundingMethod: 'card' as const,
+          card: { preferredProvider: 'moonpay' as const },
+        }
+      case 'choose':
+        // Full Privy funding menu (card / exchange / transfer).
+        return baseOpts
+    }
+  }
+
   async function go() {
     setBusy(true)
     setError(null)
@@ -109,17 +167,9 @@ export default function Fund({
           return
         }
         setStatus('Opening secure payment…')
-        // Preferred card provider = Coinbase (dashboard must keep Coinbase Onramp
-        // enabled). defaultFundingMethod skips method pickers when possible.
         await fundWallet({
           address: depositRoute.depositAddress,
-          options: {
-            chain: base,
-            amount: String(value),
-            asset: 'USDC',
-            defaultFundingMethod: 'card',
-            card: { preferredProvider: 'coinbase' },
-          },
+          options: fundOptionsFor(payMethod),
         })
         setDone(true)
         return
@@ -299,19 +349,59 @@ export default function Fund({
       )}
 
       {direction === 'in' && depositRoute && (
-        <div className="notice" aria-live="polite">
-          <p style={{ margin: 0 }}>
-            Current estimate:{' '}
-            <span className="figure">
-              {formatMoney(currency, Number(depositRoute.quotedReceived))}
-            </span>
-          </p>
-          <p className="small muted" style={{ margin: '6px 0 0' }}>
-            Floor if markets move:{' '}
-            {formatMoney(currency, Number(depositRoute.minimumReceived))}. The
-            final amount follows your payment and the live exchange route.
-          </p>
-        </div>
+        <>
+          <div className="notice" aria-live="polite">
+            <p style={{ margin: 0 }}>
+              Current estimate:{' '}
+              <span className="figure">
+                {formatMoney(currency, Number(depositRoute.quotedReceived))}
+              </span>
+            </p>
+            <p className="small muted" style={{ margin: '6px 0 0' }}>
+              Floor if markets move:{' '}
+              {formatMoney(currency, Number(depositRoute.minimumReceived))}. The
+              final amount follows your payment and the live exchange route.
+            </p>
+          </div>
+
+          <div className="field">
+            <label id="pay-how">How do you want to pay?</label>
+            <div
+              className="presets"
+              role="radiogroup"
+              aria-labelledby="pay-how"
+              style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}
+            >
+              {PAY_METHODS.map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={payMethod === m.id}
+                  aria-pressed={payMethod === m.id}
+                  onClick={() => setPayMethod(m.id)}
+                  style={{
+                    textAlign: 'left',
+                    padding: '12px 14px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 4,
+                  }}
+                >
+                  <span className="figure" style={{ fontSize: '1rem' }}>
+                    {m.label}
+                    {m.id === 'card' ? ' · recommended' : ''}
+                  </span>
+                  <span className="small muted">{m.blurb}</span>
+                </button>
+              ))}
+            </div>
+            <p className="small muted" style={{ marginTop: 8 }}>
+              Coinbase is optional. Card or bank does not require a Coinbase
+              account.
+            </p>
+          </div>
+        </>
       )}
 
       {status && (
@@ -335,7 +425,13 @@ export default function Fund({
           ? status || 'One moment…'
           : direction === 'in'
             ? depositRoute
-              ? 'Continue to secure payment'
+              ? payMethod === 'coinbase'
+                ? 'Continue with Coinbase'
+                : payMethod === 'moonpay'
+                  ? 'Continue with MoonPay'
+                  : payMethod === 'choose'
+                    ? 'Open payment options'
+                    : 'Continue with card or bank'
               : 'Review deposit'
             : 'Withdraw'}
       </button>
