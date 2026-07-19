@@ -695,6 +695,8 @@ async function enterSteady(
 
   // createPair first (own tx) — createPair+addLiquidity in one shot often OOGs.
   if (needCreate) {
+    const { ensureRhGas: topUpRh, MIN_RH_WEI } = await import('./gasBridge')
+    await topUpRh({ owner, send, progress, minWei: MIN_RH_WEI })
     progress('Creating Steady market…')
     try {
       await sendAndWait(send, {
@@ -704,6 +706,7 @@ async function enterSteady(
           functionName: 'createPair',
           args: [pool.cash, wrapper],
         }),
+        gas: 3_000_000n,
       })
     } catch (e) {
       // Pair may already exist from a race; continue if getPair works.
@@ -711,11 +714,11 @@ async function enterSteady(
       if (!again) {
         const m = e instanceof Error ? e.message : 'createPair failed'
         throw new Error(
-          /unknown reason|reverted|insufficient funds|gas|sponsor|network fee/i.test(
-            m,
-          )
-            ? 'Could not create Steady market. Need a little ETH on Base (~$0.30+) for network fees — send it to your Accrue address, then try again. Your dollars are safe.'
-            : m,
+          /insufficient funds|intrinsic gas|gas required|out of gas/i.test(m)
+            ? 'Could not create Steady market — need more network fee. Fund Base ETH and try again.'
+            : /reverted|unknown reason/i.test(m)
+              ? 'Could not create Steady market. Wait a moment and try again — your dollars are safe.'
+              : m,
         )
       }
     }
@@ -906,8 +909,18 @@ async function enterGrowth(
   }
 
   // Create Accrue’s V2 Growth pair if missing — this is “we open it.”
+  // Re-top RH gas first: swap/approves already burned some, createPair needs ~2.5M gas.
   let pair = await resolvePair(pool.cash, pool.risk, pool.candidate?.pair)
   if (!pair) {
+    const { ensureRhGas: topUpRh, MIN_RH_WEI } = await import('./gasBridge')
+    const { parseEther } = await import('viem')
+    // Need headroom for createPair + approves + addLiquidity after earlier txs.
+    await topUpRh({
+      owner,
+      send,
+      progress,
+      minWei: MIN_RH_WEI > parseEther('0.0005') ? MIN_RH_WEI : parseEther('0.0005'),
+    })
     progress('Creating Growth market…')
     try {
       await sendAndWait(send, {
@@ -917,14 +930,25 @@ async function enterGrowth(
           functionName: 'createPair',
           args: [pool.cash, pool.risk],
         }),
+        // Fixed gas — createPair is heavy; avoid flaky estimate after long flows.
+        gas: 3_000_000n,
       })
     } catch (e) {
       pair = await resolvePair(pool.cash, pool.risk)
       if (!pair) {
         const m = e instanceof Error ? e.message : 'createPair failed'
+        if (
+          /insufficient funds|intrinsic gas|gas required exceeds|out of gas/i.test(
+            m,
+          )
+        ) {
+          throw new Error(
+            'Could not create Growth market — need a little more network fee on Robinhood. Fund Base ETH and try again (we top up RH gas automatically).',
+          )
+        }
         throw new Error(
-          /gas|insufficient funds|network fee/i.test(m)
-            ? 'Could not create Growth market — need a little more network fee. Try again.'
+          /reverted|unknown reason/i.test(m)
+            ? 'Could not create Growth market on-chain. Wait a moment and try again — your dollars are still in your account.'
             : m,
         )
       }

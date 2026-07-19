@@ -19,15 +19,15 @@ const RELAY_QUOTE_URL =
   import.meta.env.VITE_RELAY_QUOTE_URL ?? 'https://api.relay.link/quote/v2'
 
 /**
- * Enough for Steady bootstrap on RH: createPair (~2.5M gas) + approves + addLiquidity.
- * At ~0.06 gwei createPair alone is ~0.00015–0.00019 ETH — 0.00005 was far too low
- * and left wallets “funded” but unable to create the Steady pair.
+ * Growth does: approve + V3 swap + createPair (~2.5M) + 2× approve + addLiquidity.
+ * createPair alone is ~0.00023 ETH at ~0.06 gwei; full Growth path needs more headroom
+ * after earlier txs burn gas.
  */
-const MIN_RH_WEI = parseEther('0.00035')
-/** Floor on Base before we attempt a Relay bridge (~$0.30+). */
-const MIN_BRIDGE_WEI = parseEther('0.00015')
+export const MIN_RH_WEI = parseEther('0.0008')
+/** Floor on Base before we attempt a Relay bridge. */
+const MIN_BRIDGE_WEI = parseEther('0.0002')
 /** Preferred top-up when they have more Base ETH. */
-const PREFERRED_BRIDGE_WEI = parseEther('0.0005')
+const PREFERRED_BRIDGE_WEI = parseEther('0.0015')
 
 const baseClient = createPublicClient({
   chain: base,
@@ -77,19 +77,22 @@ export async function ensureRhGas({
   owner,
   send,
   progress,
+  /** Override RH ETH floor (e.g. re-top before createPair). */
+  minWei = MIN_RH_WEI,
 }: {
   owner: Address
   send: Sender
   progress: Progress
+  minWei?: bigint
 }): Promise<void> {
   const rh = await rhEthBalance(owner)
-  if (rh >= MIN_RH_WEI) return
+  if (rh >= minWei) return
 
   const onBase = await baseEthBalance(owner)
 
   if (onBase < MIN_BRIDGE_WEI) {
     throw new Error(
-      `GAS_TOPUP_NEEDED:${owner}:You have ${fmtEth(onBase)} ETH on Base — need at least ~${fmtEth(MIN_BRIDGE_WEI)} ETH on Base (about $0.30+) for network fees. Send ETH on Base to the address below, then try again. Your dollars are safe.`,
+      `GAS_TOPUP_NEEDED:${owner}:You have ${fmtEth(onBase)} ETH on Base — need at least ~${fmtEth(MIN_BRIDGE_WEI)} ETH on Base (about $0.50+) for network fees. Send ETH on Base to the address below, then try again. Your dollars are safe.`,
     )
   }
 
@@ -177,7 +180,6 @@ export async function ensureRhGas({
   }
 
   progress('Waiting for network fee to land on your account…')
-  const before = rh
   for (let i = 0; i < 50; i++) {
     try {
       const status = await fetchRelayIntentStatus(step.requestId)
@@ -193,18 +195,14 @@ export async function ensureRhGas({
       }
     }
     const now = await rhEthBalance(owner)
-    if (now >= MIN_RH_WEI) return
-    if (now > before && i > 8) {
-      // Partial land — often enough for one create+deposit
-      if (now >= parseEther('0.00003')) return
-    }
+    if (now >= minWei) return
     await new Promise((r) => setTimeout(r, 2000))
   }
 
   const final = await rhEthBalance(owner)
-  if (final < MIN_RH_WEI && final <= before) {
+  if (final < minWei) {
     throw new Error(
-      `GAS_TOPUP_NEEDED:${owner}:Network fee is still settling (Base ETH left: check your wallet). Wait 30s and try again. Address: ${owner}`,
+      `GAS_TOPUP_NEEDED:${owner}:Network fee is still settling (have ${fmtEth(final)} RH ETH, need ~${fmtEth(minWei)}). Wait 30s and try again. Address: ${owner}`,
     )
   }
 }
