@@ -3,6 +3,8 @@
 
 import {
   createPublicClient,
+  fallback,
+  formatEther,
   http,
   parseEther,
   zeroAddress,
@@ -16,14 +18,23 @@ import { publicClient, type Progress, type Sender } from './vault'
 const RELAY_QUOTE_URL =
   import.meta.env.VITE_RELAY_QUOTE_URL ?? 'https://api.relay.link/quote/v2'
 
-/** Enough for create + approve + deposit with headroom. */
-const MIN_RH_WEI = parseEther('0.00008')
-/** Bridge this much Base ETH → RH when top-up is needed (~cents of fee). */
-const BRIDGE_WEI = parseEther('0.0003')
+/** Enough for create + approve + deposit (RH gas is cheap). */
+const MIN_RH_WEI = parseEther('0.00005')
+/** Floor: ~$0.25–0.40 depending on ETH price — must be ≤ typical “$1 of ETH”. */
+const MIN_BRIDGE_WEI = parseEther('0.0001')
+/** Preferred top-up when they have more. */
+const PREFERRED_BRIDGE_WEI = parseEther('0.00025')
 
 const baseClient = createPublicClient({
   chain: base,
-  transport: http(undefined, { timeout: 15_000 }),
+  transport: fallback(
+    [
+      http('https://mainnet.base.org', { timeout: 12_000 }),
+      http('https://base.publicnode.com', { timeout: 12_000 }),
+      http('https://base.llamarpc.com', { timeout: 12_000 }),
+    ],
+    { rank: false },
+  ),
 })
 
 export async function rhEthBalance(owner: Address): Promise<bigint> {
@@ -34,9 +45,21 @@ export async function baseEthBalance(owner: Address): Promise<bigint> {
   return baseClient.getBalance({ address: owner })
 }
 
+function fmtEth(wei: bigint): string {
+  const s = formatEther(wei)
+  const n = Number(s)
+  if (!Number.isFinite(n)) return s
+  if (n === 0) return '0'
+  if (n < 0.000001) return s
+  return n.toFixed(6).replace(/\.?0+$/, '')
+}
+
 /**
  * Ensure the user can pay RH network fees. If RH ETH is low and Base ETH is
  * available, Relay-bridge a scrap of ETH Base → RH (same address).
+ *
+ * Uses adaptive amount: bridge preferred if they have it, else whatever they
+ * hold above MIN_BRIDGE (so ~$0.90 of ETH is not rejected by a 0.0003 floor).
  */
 export async function ensureRhGas({
   owner,
@@ -51,14 +74,20 @@ export async function ensureRhGas({
   if (rh >= MIN_RH_WEI) return
 
   const onBase = await baseEthBalance(owner)
-  if (onBase < BRIDGE_WEI) {
-    // Include the full address — users need somewhere to send Base ETH.
+
+  if (onBase < MIN_BRIDGE_WEI) {
     throw new Error(
-      `GAS_TOPUP_NEEDED:${owner}:Send a little ETH on Base to your Accrue address, then try again. Network fee is separate from your dollars (which are safe).`,
+      `GAS_TOPUP_NEEDED:${owner}:You have ${fmtEth(onBase)} ETH on Base — need at least ~${fmtEth(MIN_BRIDGE_WEI)} ETH on Base (about $0.30+) to open standard growth. Send ETH on Base to the address below, then try again. Your dollars are safe.`,
     )
   }
 
-  progress('Moving a tiny network fee from Base onto your account…')
+  // Bridge preferred amount, or everything they have if between min and preferred.
+  const bridgeAmount =
+    onBase >= PREFERRED_BRIDGE_WEI ? PREFERRED_BRIDGE_WEI : onBase
+
+  progress(
+    `Moving ${fmtEth(bridgeAmount)} ETH from Base for network fees…`,
+  )
 
   const quoteRes = await fetch(RELAY_QUOTE_URL, {
     method: 'POST',
@@ -71,7 +100,7 @@ export async function ensureRhGas({
       destinationChainId: CHAIN_ID,
       originCurrency: zeroAddress,
       destinationCurrency: zeroAddress,
-      amount: BRIDGE_WEI.toString(),
+      amount: bridgeAmount.toString(),
       tradeType: 'EXACT_INPUT',
       useDepositAddress: true,
     }),
@@ -99,19 +128,20 @@ export async function ensureRhGas({
   const depositAddress = (step?.depositAddress || item?.to) as
     | Address
     | undefined
-  const valueRaw = item?.value ?? BRIDGE_WEI.toString()
-  const value = BigInt(valueRaw)
+  // Prefer quote’s exact value (includes any fee encoding Relay expects).
+  let value = item?.value ? BigInt(item.value) : bridgeAmount
+  // Never try to send more than the wallet holds.
+  if (value > onBase) value = onBase
 
   if (
     !step?.requestId ||
     !depositAddress ||
     !depositAddress.startsWith('0x') ||
-    value <= 0n
+    value < MIN_BRIDGE_WEI
   ) {
     throw new Error('Could not prepare network-fee top-up route.')
   }
 
-  // Base-side send (gas can be sponsored on Base).
   const hash = await send({
     to: depositAddress,
     value,
@@ -122,9 +152,9 @@ export async function ensureRhGas({
     throw new Error('Network-fee top-up transaction failed on Base.')
   }
 
-  progress('Waiting for network fee to land…')
+  progress('Waiting for network fee to land on your account…')
   const before = rh
-  for (let i = 0; i < 45; i++) {
+  for (let i = 0; i < 50; i++) {
     try {
       const status = await fetchRelayIntentStatus(step.requestId)
       if (status === 'success') break
@@ -139,17 +169,18 @@ export async function ensureRhGas({
       }
     }
     const now = await rhEthBalance(owner)
-    if (now >= MIN_RH_WEI || now > before) {
-      // landed (or enough bump)
-      if (now >= MIN_RH_WEI) return
+    if (now >= MIN_RH_WEI) return
+    if (now > before && i > 8) {
+      // Partial land — often enough for one create+deposit
+      if (now >= parseEther('0.00003')) return
     }
     await new Promise((r) => setTimeout(r, 2000))
   }
 
   const final = await rhEthBalance(owner)
-  if (final < MIN_RH_WEI) {
+  if (final < MIN_RH_WEI && final <= before) {
     throw new Error(
-      'Network fee is still settling. Wait a few seconds and try again — or check that Base ETH left your wallet.',
+      `GAS_TOPUP_NEEDED:${owner}:Network fee is still settling (Base ETH left: check your wallet). Wait 30s and try again. Address: ${owner}`,
     )
   }
 }
