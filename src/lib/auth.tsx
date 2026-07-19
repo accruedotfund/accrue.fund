@@ -108,7 +108,9 @@ function humanSendError(err: unknown, chainId: number): Error {
   }
   if (/insufficient funds|gas required|intrinsic gas/i.test(msg)) {
     return new Error(
-      'Not enough network fee on this chain. Deposits still work via Base → Relay.',
+      chainId === CHAIN_ID
+        ? 'Not enough Robinhood network fee. If you have ETH on Base (same address), retry — we’ll move a tiny fee over automatically. Deposits never need RH ETH.'
+        : 'Not enough ETH on Base for this step. Top up Base ETH and try again.',
     )
   }
   return err instanceof Error ? err : new Error(msg || 'Transaction failed')

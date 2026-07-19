@@ -8,6 +8,7 @@ import {
   fetchRelayIntentStatus,
   type RelayWithdrawRoute,
 } from './relay'
+import { ensureRhGas } from './gasBridge'
 import {
   redeemStandard,
   sendAndWait,
@@ -101,6 +102,10 @@ export async function windDownViaRelay({
 }): Promise<RelayWithdrawRoute> {
   if (!rail.stable) throw new Error('This account is not configured')
   const units = parseUnits(amount, rail.decimals)
+
+  // RH txs need RH ETH — top up from Base via Relay if needed.
+  await ensureRhGas({ owner, send, progress })
+
   let available = await tokenBalance(rail.stable, owner)
 
   if (available < units && rail.wrapper) {

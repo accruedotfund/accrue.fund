@@ -1,20 +1,24 @@
 import { useState } from 'react'
 import { useAuth } from '../lib/auth'
 import { ensureUsdWrapper, readUsdWrapper } from '../lib/factory'
+import { ensureRhGas } from '../lib/gasBridge'
 import type { Holding } from '../lib/nav'
 import { formatMoney, setRailWrapper } from '../lib/rails'
 import { depositAvailable, redeemStandard } from '../lib/vault'
 
 function humanMoveError(cause: unknown): string {
   const msg = cause instanceof Error ? cause.message : String(cause ?? '')
-  if (/insufficient funds|gas required|intrinsic gas|out of gas/i.test(msg)) {
-    return 'Needs a tiny network fee on Robinhood Chain (ETH). Your dollars are safe as available — add a little ETH to that same address, then try again.'
+  if (/Base ETH|network fee|top-up|top up|Robinhood/i.test(msg) && /safe|try again|settling/i.test(msg)) {
+    return msg
+  }
+  if (/insufficient funds|gas required|intrinsic gas|out of gas|network fee on this chain/i.test(msg)) {
+    return 'Robinhood needs a tiny network fee. If you have ETH on Base (same address), we’ll move a scrap over automatically — tap again. Your dollars stay safe.'
   }
   if (/app secret|gas sponsored|sponsor/i.test(msg)) {
-    return 'Network fee couldn’t be sponsored here. Fund a little ETH on Robinhood for this address, then try again. Your available balance is untouched.'
+    return 'Network fee couldn’t be sponsored on Robinhood. We’ll top up from Base ETH when you retry. Your available balance is untouched.'
   }
-  if (/not configured/i.test(msg)) {
-    return 'Standard growth isn’t open on the network yet. We’ll open it once when you move balance (needs a tiny RH network fee).'
+  if (/not configured|not open/i.test(msg)) {
+    return 'Standard growth isn’t open yet — we’ll open it when you move balance (uses a tiny network fee).'
   }
   return msg || 'The balance did not move. Nothing was lost.'
 }
@@ -54,6 +58,12 @@ export default function Account({
     setError(null)
     setBusy('Preparing…')
     try {
+      // Base ETH ≠ RH ETH. Top up RH gas from Base via Relay when needed.
+      await ensureRhGas({
+        owner: address,
+        send: sendTransaction,
+        progress: setBusy,
+      })
       if (direction === 'grow') {
         if (holding.rail.code === 'USD') {
           await ensureStandardVault()
@@ -155,8 +165,8 @@ export default function Account({
 
       <p className="small muted">
         {needsVaultOpen
-          ? 'Standard growth opens once on the network (tiny Robinhood network fee in ETH). After that, moving available → standard only needs the same fee for the deposit.'
-          : 'A small entry or exit charge stays in the standard account and increases value per unit for everyone who remains.'}
+          ? 'Standard growth opens once. If you only have ETH on Base, we’ll move a tiny network fee over automatically, then open growth and deposit.'
+          : 'A small entry or exit charge stays in the standard account and increases value per unit for everyone who remains. Network fees use Robinhood ETH (auto-topped from Base when needed).'}
       </p>
     </div>
   )
