@@ -268,7 +268,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 async function postRpc(
   res: VercelResponse,
   privy: PrivyClient,
-  walletId: string,
+  _walletId: string,
   url: string,
   rpcBody: Record<string, unknown>,
   signature: string,
