@@ -482,43 +482,107 @@ export interface BoostPosition {
   markValue: number
 }
 
-/** Read Steady + Growth LP positions for a wallet. */
+function markFromLp(
+  lp: bigint,
+  cashReserve: bigint,
+  riskReserve: bigint,
+  totalSupply: bigint,
+): { cashValue: number; markValue: number } {
+  if (lp === 0n || totalSupply === 0n) {
+    return { cashValue: 0, markValue: 0 }
+  }
+  const cashPortion = (cashReserve * lp) / totalSupply
+  const riskPortion = (riskReserve * lp) / totalSupply
+  const riskInCash =
+    riskReserve > 0n ? (riskPortion * cashReserve) / riskReserve : 0n
+  return {
+    cashValue: Number(formatUnits(cashPortion, CASH_DECIMALS)),
+    markValue: Number(formatUnits(cashPortion + riskInCash, CASH_DECIMALS)),
+  }
+}
+
+/**
+ * Read Steady + Growth LP positions for a wallet.
+ * Always re-reads pair reserves on-chain — do NOT trust resolvePool().totalSupply
+ * (bootstrap stubs set totalSupply=0 and used to hide real LP balances).
+ */
 export async function fetchBoostPositions(
   owner: Address,
 ): Promise<BoostPosition[]> {
   const out: BoostPosition[] = []
-  for (const tier of ['steady', 'growth'] as const) {
+  const cash = CASH_TOKEN
+  if (!cash) return out
+
+  // Steady: USDG ↔ wUSDG
+  try {
+    const wrapper = await resolveUsdWrapper()
+    if (wrapper) {
+      const pair = await resolvePair(cash, wrapper, steadyPairOverride())
+      if (pair && pair !== zeroAddress) {
+        const lp = await publicClient.readContract({
+          address: pair,
+          abi: pairAbi,
+          functionName: 'balanceOf',
+          args: [owner],
+        })
+        if (lp > 0n) {
+          const sides = await readPairSides(pair, cash)
+          if (sides.totalSupply > 0n) {
+            const m = markFromLp(
+              lp,
+              sides.cashReserve,
+              sides.riskReserve,
+              sides.totalSupply,
+            )
+            out.push({
+              tier: 'steady',
+              strategyId: 'steady',
+              pair,
+              lpUnits: lp,
+              cashValue: m.cashValue,
+              markValue: m.markValue,
+            })
+          }
+        }
+      }
+    }
+  } catch {
+    /* steady not readable */
+  }
+
+  // Growth: scan EVERY curated stock pair (user may hold LP on more than one).
+  for (const candidate of GROWTH_CANDIDATES) {
     try {
-      const pool = await resolvePool(tier)
-      if (!pool || pool.totalSupply === 0n) continue
+      const pair = await resolvePair(cash, candidate.token, candidate.pair)
+      if (!pair || pair === zeroAddress) continue
       const lp = await publicClient.readContract({
-        address: pool.pair,
+        address: pair,
         abi: pairAbi,
         functionName: 'balanceOf',
         args: [owner],
       })
       if (lp === 0n) continue
-      const cashPortion = (pool.cashReserve * lp) / pool.totalSupply
-      const riskPortion = (pool.riskReserve * lp) / pool.totalSupply
-      // Mark risk at pool spot: risk * (cashReserve/riskReserve)
-      const riskInCash =
-        pool.riskReserve > 0n
-          ? (riskPortion * pool.cashReserve) / pool.riskReserve
-          : 0n
+      const sides = await readPairSides(pair, cash)
+      if (sides.totalSupply === 0n) continue
+      const m = markFromLp(
+        lp,
+        sides.cashReserve,
+        sides.riskReserve,
+        sides.totalSupply,
+      )
       out.push({
-        tier,
-        strategyId: pool.strategyId,
-        pair: pool.pair,
+        tier: 'growth',
+        strategyId: 'growth',
+        pair,
         lpUnits: lp,
-        cashValue: Number(formatUnits(cashPortion, CASH_DECIMALS)),
-        markValue: Number(
-          formatUnits(cashPortion + riskInCash, CASH_DECIMALS),
-        ),
+        cashValue: m.cashValue,
+        markValue: m.markValue,
       })
     } catch {
-      // pool not live
+      /* skip candidate */
     }
   }
+
   return out
 }
 
