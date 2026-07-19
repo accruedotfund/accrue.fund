@@ -330,9 +330,9 @@ async function resolvePair(
 }
 
 /**
- * Steady = USDG ↔ wUSDG. Open whenever the standard vault exists.
- * If the Uniswap pair is missing/empty, first "Turn on" seeds it via
- * addLiquidity (router creates the pair). That is intentional bootstrap.
+ * Steady = USDG ↔ wUSDG. Open whenever the standard vault + router exist.
+ * Unlike Growth, thin/dust pairs stay open — first LPs seed or top up.
+ * Missing pair → bootstrap (createPair + addLiquidity on Turn on).
  */
 export async function resolveSteadyPool(): Promise<ResolvedPool | null> {
   const cash = CASH_TOKEN
@@ -343,38 +343,29 @@ export async function resolveSteadyPool(): Promise<ResolvedPool | null> {
   if (pair) {
     try {
       const sides = await readPairSides(pair, cash)
-      if (poolIsLiquid(sides.cashReserve, sides.riskReserve, CASH_DECIMALS)) {
-        return {
-          tier: 'steady',
-          strategyId: 'steady',
-          pair,
-          cash,
-          risk: wrapper,
-          riskDecimals: CASH_DECIMALS,
-          cashReserve: sides.cashReserve,
-          riskReserve: sides.riskReserve,
-          totalSupply: sides.totalSupply,
-        }
+      const empty =
+        sides.totalSupply === 0n ||
+        (sides.cashReserve === 0n && sides.riskReserve === 0n)
+      const liquid = poolIsLiquid(
+        sides.cashReserve,
+        sides.riskReserve,
+        CASH_DECIMALS,
+      )
+      return {
+        tier: 'steady',
+        strategyId: 'steady',
+        pair,
+        cash,
+        risk: wrapper,
+        riskDecimals: CASH_DECIMALS,
+        cashReserve: sides.cashReserve,
+        riskReserve: sides.riskReserve,
+        totalSupply: sides.totalSupply,
+        // Empty = pure seed. Thin = still joinable (use soft mins on LP).
+        bootstrap: empty || !liquid,
       }
-      // Empty pair (0/0) — still bootstrappable
-      if (sides.totalSupply === 0n || (sides.cashReserve === 0n && sides.riskReserve === 0n)) {
-        return {
-          tier: 'steady',
-          strategyId: 'steady',
-          pair,
-          cash,
-          risk: wrapper,
-          riskDecimals: CASH_DECIMALS,
-          cashReserve: 0n,
-          riskReserve: 0n,
-          totalSupply: 0n,
-          bootstrap: true,
-        }
-      }
-      // Dust/junk pair — refuse
-      return null
     } catch {
-      /* fall through to bootstrap without pair read */
+      /* fall through — treat as bootstrap */
     }
   }
 
@@ -644,15 +635,19 @@ async function enterSteady(
     throw new Error('Need both cash and standard shares for Steady — try again')
   }
 
-  // Live pool: match ratio. Bootstrap / empty: use full balanced bags.
+  // Live deep pool: match ratio. Empty/thin: seed bags (bootstrap path).
   let amounts: { a: bigint; b: bigint }
-  const bootstrap =
-    pool.bootstrap ||
+  const needCreate =
     pool.pair === zeroAddress ||
+    !(await resolvePair(pool.cash, wrapper, steadyPairOverride()))
+  const emptyPool =
     pool.cashReserve === 0n ||
-    pool.riskReserve === 0n
+    pool.riskReserve === 0n ||
+    pool.totalSupply === 0n
+  // Thin pair: still match existing ratio so we don't blow up the book.
+  const thin = Boolean(pool.bootstrap) && !emptyPool && !needCreate
 
-  if (bootstrap) {
+  if (needCreate || emptyPool) {
     amounts = { a: cashBal, b: shareBal }
   } else {
     const sides = await readPairSides(pool.pair, pool.cash)
@@ -668,32 +663,29 @@ async function enterSteady(
   }
 
   // createPair first (own tx) — createPair+addLiquidity in one shot often OOGs.
-  if (bootstrap) {
-    const existing = await resolvePair(pool.cash, wrapper, steadyPairOverride())
-    if (!existing) {
-      progress('Creating Steady market…')
-      try {
-        await sendAndWait(send, {
-          to: PAIR_FACTORY,
-          data: encodeFunctionData({
-            abi: factoryAbi,
-            functionName: 'createPair',
-            args: [pool.cash, wrapper],
-          }),
-        })
-      } catch (e) {
-        // Pair may already exist from a race; continue if getPair works.
-        const again = await resolvePair(pool.cash, wrapper)
-        if (!again) {
-          const m = e instanceof Error ? e.message : 'createPair failed'
-          throw new Error(
-            /unknown reason|reverted|insufficient funds|gas|sponsor|network fee/i.test(
-              m,
-            )
-              ? 'Could not create Steady market. Need a little ETH on Base (~$0.30+) for network fees — send it to your Accrue address, then try again. Your dollars are safe.'
-              : m,
+  if (needCreate) {
+    progress('Creating Steady market…')
+    try {
+      await sendAndWait(send, {
+        to: PAIR_FACTORY,
+        data: encodeFunctionData({
+          abi: factoryAbi,
+          functionName: 'createPair',
+          args: [pool.cash, wrapper],
+        }),
+      })
+    } catch (e) {
+      // Pair may already exist from a race; continue if getPair works.
+      const again = await resolvePair(pool.cash, wrapper)
+      if (!again) {
+        const m = e instanceof Error ? e.message : 'createPair failed'
+        throw new Error(
+          /unknown reason|reverted|insufficient funds|gas|sponsor|network fee/i.test(
+            m,
           )
-        }
+            ? 'Could not create Steady market. Need a little ETH on Base (~$0.30+) for network fees — send it to your Accrue address, then try again. Your dollars are safe.'
+            : m,
+        )
       }
     }
   }
@@ -701,11 +693,18 @@ async function enterSteady(
   await ensureAllowance(pool.cash, owner, BOOST_ROUTER, amounts.a, send, progress)
   await ensureAllowance(wrapper, owner, BOOST_ROUTER, amounts.b, send, progress)
   progress(
-    bootstrap ? 'Seeding Steady with your balance…' : 'Turning on Steady Boost…',
+    needCreate || emptyPool
+      ? 'Seeding Steady with your balance…'
+      : thin
+        ? 'Adding to Steady…'
+        : 'Turning on Steady Boost…',
   )
 
-  const minA = bootstrap ? 0n : minAfterSlippage(amounts.a, 500n)
-  const minB = bootstrap ? 0n : minAfterSlippage(amounts.b, 500n)
+  // Soft mins on thin/bootstrap — transfer tax + shallow book need slack.
+  const minA =
+    needCreate || emptyPool || thin ? 0n : minAfterSlippage(amounts.a, 500n)
+  const minB =
+    needCreate || emptyPool || thin ? 0n : minAfterSlippage(amounts.b, 500n)
   try {
     await sendAndWait(send, {
       to: BOOST_ROUTER,
