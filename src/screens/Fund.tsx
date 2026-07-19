@@ -1,15 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 import { Browser } from '@capacitor/browser'
-import { useFundWallet } from '@privy-io/react-auth'
+import { useFiatOnramp, useFundWallet } from '@privy-io/react-auth'
 import { base } from 'viem/chains'
 import { formatUnits } from 'viem'
 import { useAuth } from '../lib/auth'
 import {
   prepareRelayDepositRoute,
   waitForDepositSettlement,
+  RELAY_ORIGIN_ASSET,
   type RelayDepositRoute,
 } from '../lib/relay'
-import { withdrawAvailableViaRelay } from '../lib/withdraw'
+import { windDownViaRelay } from '../lib/withdraw'
 import { tokenBalance } from '../lib/vault'
 import type { Holding } from '../lib/nav'
 import {
@@ -20,10 +21,9 @@ import {
   type CurrencyCode,
 } from '../lib/rails'
 
-// Configure surface: pick direction, currency, amount → review → how to pay → send.
-// In: user chooses payment partner → Base USDC at Relay deposit → Relay → RH USDG.
-// After pay: poll Relay + on-chain balance and show settled success.
-// Out: available USDG → Relay → Base USDC; optional bank URL via API_BASE.
+// Settlement is always Relay both ways (no chain words in UI):
+//   IN  card/bank/etc → Base USDC → Relay deposit addr → RH dollar balance
+//   OUT free cash on RH → Relay → Base USDC → optional bank hop
 
 type Direction = 'in' | 'out'
 /** How the user funds the Base USDC deposit leg. */
@@ -73,14 +73,19 @@ function humanError(err: unknown, direction: Direction): string {
   if (/not configured|not ready|session has expired|Opening your dollar/i.test(msg)) {
     return msg
   }
+  if (/insufficient funds|gas required|intrinsic gas|network fee/i.test(msg)) {
+    return direction === 'out'
+      ? 'Cash out needs a tiny network fee on Robinhood (ETH on this address). Your dollars are untouched — add a little ETH, then try again.'
+      : msg
+  }
   if (/Relay|route/i.test(msg)) {
     return direction === 'in'
       ? 'We couldn’t prepare a deposit route right now. Nothing was charged — try again.'
-      : 'We couldn’t prepare a withdrawal route right now. Your balance is untouched — try again.'
+      : 'We couldn’t prepare a cash-out route right now. Your balance is untouched — try again.'
   }
   return direction === 'in'
     ? 'We couldn’t start your deposit. Nothing was charged — try again.'
-    : 'We couldn’t start your withdrawal. Your balance is untouched — try again.'
+    : 'We couldn’t start your cash out. Your balance is untouched — try again.'
 }
 
 export default function Fund({
@@ -93,6 +98,7 @@ export default function Fund({
   const { email, address, getAccessToken, sendTransaction, walletReady } =
     useAuth()
   const { fundWallet } = useFundWallet()
+  const { fund: fundFiat } = useFiatOnramp()
   const [direction, setDirection] = useState<Direction>('in')
   const [currency, setCurrency] = useState<CurrencyCode>('USD')
   const [amount, setAmount] = useState('')
@@ -105,6 +111,8 @@ export default function Fund({
   )
   const [payMethod, setPayMethod] = useState<PayMethod>('card')
   const [depositOutcome, setDepositOutcome] = useState<DepositOutcome>(null)
+  /** Withdraw settled to Base (Relay reverse). */
+  const [withdrawSettled, setWithdrawSettled] = useState(false)
   const settleAbort = useRef<AbortController | null>(null)
 
   useEffect(() => {
@@ -116,8 +124,11 @@ export default function Fund({
   const value = parseFloat(amount)
   const rail = RAILS.find((item) => item.code === currency)!
   const sourceCurrency = currency === 'XAU' ? 'USD' : currency
-  const held =
-    holdings?.find((h) => h.rail.code === currency)?.availableBalance ?? 0
+  const holding = holdings?.find((h) => h.rail.code === currency)
+  const available = holding?.availableBalance ?? 0
+  const standard = holding?.standardBalance ?? 0
+  /** Cash that can leave: available + standard (we free standard on wind-down). */
+  const freeCash = available + standard
   const railReady = Boolean(rail.stable) && rail.status === 'live'
   const invalid =
     !amount || isNaN(value)
@@ -128,8 +139,8 @@ export default function Fund({
           ? 'This account isn’t open for deposits yet.'
           : direction === 'in' && value < MIN_DEPOSIT
             ? `Minimum is ${formatMoney(sourceCurrency, MIN_DEPOSIT)}.`
-            : direction === 'out' && value > held
-              ? `You have ${formatMoney(currency, held)} available.`
+            : direction === 'out' && value > freeCash
+              ? `You have ${formatMoney(currency, freeCash)} free to cash out.`
               : null
 
   function resetRoute() {
@@ -142,36 +153,55 @@ export default function Fund({
     settleAbort.current = null
     setDone(false)
     setDepositOutcome(null)
+    setWithdrawSettled(false)
     setAmount('')
     setDepositRoute(null)
     setStatus(null)
     setError(null)
   }
 
-  function fundOptionsFor(method: PayMethod) {
+  /** Pay Base USDC into the Relay deposit address (Base → Relay → RH dollars). */
+  async function openDepositPayment(route: RelayDepositRoute) {
+    if (payMethod === 'card') {
+      // Fiat onramp destinations the Relay sink — not a personal QR receive.
+      await fundFiat({
+        source: {
+          assets: ['usd', 'eur', 'gbp'],
+          defaultAsset: sourceCurrency.toLowerCase() as 'usd' | 'eur' | 'gbp',
+        },
+        destination: {
+          address: route.depositAddress,
+          chain: 'eip155:8453',
+          asset: RELAY_ORIGIN_ASSET,
+        },
+        environment: import.meta.env.PROD ? 'production' : 'sandbox',
+        defaultAmount: String(value),
+      })
+      return
+    }
     const baseOpts = {
       chain: base,
       amount: String(value),
       asset: 'USDC' as const,
     }
-    switch (method) {
-      case 'card':
-        return { ...baseOpts, defaultFundingMethod: 'card' as const }
-      case 'coinbase':
-        return {
-          ...baseOpts,
-          defaultFundingMethod: 'exchange' as const,
-          card: { preferredProvider: 'coinbase' as const },
-        }
-      case 'moonpay':
-        return {
-          ...baseOpts,
-          defaultFundingMethod: 'card' as const,
-          card: { preferredProvider: 'moonpay' as const },
-        }
-      case 'choose':
-        return baseOpts
-    }
+    const options =
+      payMethod === 'coinbase'
+        ? {
+            ...baseOpts,
+            defaultFundingMethod: 'exchange' as const,
+            card: { preferredProvider: 'coinbase' as const },
+          }
+        : payMethod === 'moonpay'
+          ? {
+              ...baseOpts,
+              defaultFundingMethod: 'card' as const,
+              card: { preferredProvider: 'moonpay' as const },
+            }
+          : baseOpts
+    await fundWallet({
+      address: route.depositAddress,
+      options,
+    })
   }
 
   async function watchDepositSettlement(route: RelayDepositRoute) {
@@ -279,11 +309,8 @@ export default function Fund({
           return
         }
         setStatus('Opening secure payment…')
-        await fundWallet({
-          address: depositRoute.depositAddress,
-          options: fundOptionsFor(payMethod),
-        })
-        // Payment UI closed — watch on-chain / Relay settle for real feedback.
+        // Pay → Base USDC at Relay deposit address → Relay → RH USDG.
+        await openDepositPayment(depositRoute)
         setDone(true)
         setBusy(false)
         setStatus(null)
@@ -291,7 +318,8 @@ export default function Fund({
         return
       }
 
-      await withdrawAvailableViaRelay({
+      // —— wind down: free standard if needed → RH USDG → Relay → Base USDC ——
+      await windDownViaRelay({
         rail,
         owner: address,
         amount,
@@ -299,9 +327,10 @@ export default function Fund({
         progress: setStatus,
       })
       if (onRefresh) await onRefresh()
+      setWithdrawSettled(true)
 
       if (API_BASE) {
-        setStatus('Opening secure cash out…')
+        setStatus('Opening bank cash out…')
         const accessToken = await getAccessToken()
         if (!accessToken) throw new Error('Your session has expired')
         const res = await fetch(`${API_BASE}/api/accrue-offramp-session`, {
@@ -423,11 +452,12 @@ export default function Fund({
       <div className="screen" style={{ justifyContent: 'center' }}>
         <div className="empty">
           <p className="display" style={{ fontSize: '1.8rem' }}>
-            Withdrawal sent
+            {withdrawSettled ? 'Cash out on the way' : 'Withdrawal sent'}
           </p>
           <p className="small" style={{ maxWidth: '34ch' }}>
-            Your dollars are on Base first, then your cash-out partner for bank
-            arrival — typically 1–2 business days after you finish that step.
+            {withdrawSettled
+              ? 'Your dollars left the account and are settling to cash. If a bank partner opened, finish that step — bank arrival is typically 1–2 business days.'
+              : 'Your dollars are settling to cash. Bank arrival is typically 1–2 business days after the partner step.'}
           </p>
           <button
             className="btn btn-quiet"
@@ -458,7 +488,7 @@ export default function Fund({
               resetRoute()
             }}
           >
-            {d === 'in' ? 'Add money' : 'Withdraw'}
+            {d === 'in' ? 'Add money' : 'Cash out'}
           </button>
         ))}
       </div>
@@ -510,15 +540,17 @@ export default function Fund({
           }}
         />
         {invalid && <p className="error">{invalid}</p>}
-        {direction === 'out' && held > 0 && !invalid && (
+        {direction === 'out' && freeCash > 0 && !invalid && (
           <p className="small muted">
-            Available: {formatMoney(currency, held)}
+            Free to cash out: {formatMoney(currency, freeCash)}
+            {standard > 0
+              ? ` (${formatMoney(currency, available)} available · ${formatMoney(currency, standard)} standard — we’ll free standard first)`
+              : ''}
           </p>
         )}
-        {direction === 'out' && held === 0 && (
+        {direction === 'out' && freeCash === 0 && (
           <p className="small muted">
-            Make money available from the account detail first, then return
-            here to withdraw it.
+            Nothing free to cash out yet. Add money first.
           </p>
         )}
       </div>
@@ -617,12 +649,13 @@ export default function Fund({
                     ? 'Open payment options'
                     : 'Continue with card or bank'
               : 'Review deposit'
-            : 'Withdraw'}
+            : 'Cash out'}
       </button>
 
       <p className="small muted">
-        Deposits and withdrawals are processed by regulated payment partners.
-        Card and bank details never touch our servers.
+        {direction === 'in'
+          ? 'Card/bank pays on Base; we route it into your dollar account automatically.'
+          : 'Cash out frees your balance, settles it to cash, then opens bank payout when configured. Needs a tiny Robinhood network fee (ETH).'}
       </p>
     </div>
   )

@@ -1,6 +1,6 @@
-// Outbound cash movement: available USDG → Relay deposit on Robinhood →
-// Base USDC at the same EVM address. Bank cashout (Stripe/MoonPay URL) is an
-// optional second hop when VITE_API_BASE is configured.
+// Wind-down: free cash on RH → Relay deposit → Base USDC at the same EVM address.
+// Mirror of deposit (Base USDC → Relay → RH USDG). Bank/Coinbase cashout is an
+// optional second hop after Base USDC lands (VITE_API_BASE / CDP).
 
 import { encodeFunctionData, type Address, parseUnits } from 'viem'
 import {
@@ -9,6 +9,7 @@ import {
   type RelayWithdrawRoute,
 } from './relay'
 import {
+  redeemStandard,
   sendAndWait,
   tokenBalance,
   type Progress,
@@ -46,10 +47,10 @@ export async function withdrawAvailableViaRelay({
   const units = parseUnits(amount, rail.decimals)
   const available = await tokenBalance(rail.stable, owner)
   if (available < units) {
-    throw new Error('Not enough available balance — make standard balance available first')
+    throw new Error('Not enough available balance — free standard balance first')
   }
 
-  progress('Preparing your withdrawal route…')
+  progress('Preparing your cash-out route…')
   const route = await prepareRelayWithdrawRoute({
     recipient: owner,
     originAsset: rail.stable,
@@ -57,9 +58,8 @@ export async function withdrawAvailableViaRelay({
     decimals: rail.decimals,
   })
 
-  // Some Relay deposit addresses require an ERC-20 transfer (not approve+pull).
-  // Transfer is the safe default for open deposit addresses.
-  progress('Sending your available balance…')
+  // Relay open deposit address: push origin asset (RH USDG) → Relay fills Base USDC.
+  progress('Moving dollars off your account…')
   await sendAndWait(send, {
     to: rail.stable,
     data: encodeFunctionData({
@@ -69,7 +69,7 @@ export async function withdrawAvailableViaRelay({
     }),
   })
 
-  progress('Confirming settlement…')
+  progress('Confirming settlement to cash…')
   for (let i = 0; i < 40; i++) {
     const status = await fetchRelayIntentStatus(route.requestId)
     if (status === 'success') return route
@@ -80,4 +80,44 @@ export async function withdrawAvailableViaRelay({
   }
   // Do not fail hard after timeout: payment left the wallet; Relay may still settle.
   return route
+}
+
+/**
+ * Full wind-down: free standard → available if needed, then RH USDG → Base USDC
+ * via Relay at the same EVM address. Call bank/CDP hop after this returns.
+ */
+export async function windDownViaRelay({
+  rail,
+  owner,
+  amount,
+  send,
+  progress,
+}: {
+  rail: Rail
+  owner: Address
+  amount: string
+  send: Sender
+  progress: Progress
+}): Promise<RelayWithdrawRoute> {
+  if (!rail.stable) throw new Error('This account is not configured')
+  const units = parseUnits(amount, rail.decimals)
+  let available = await tokenBalance(rail.stable, owner)
+
+  if (available < units && rail.wrapper) {
+    progress('Freeing standard balance…')
+    await redeemStandard(rail, owner, send, progress)
+    available = await tokenBalance(rail.stable, owner)
+  }
+
+  if (available < units) {
+    throw new Error('Not enough balance to cash out that amount')
+  }
+
+  return withdrawAvailableViaRelay({
+    rail,
+    owner,
+    amount,
+    send,
+    progress,
+  })
 }
