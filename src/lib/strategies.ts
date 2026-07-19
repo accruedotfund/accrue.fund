@@ -43,20 +43,25 @@ export const CASH_DECIMALS = 6
  * Curated equity legs for Growth. Order is preference when liquidity ties.
  * Addresses are official Robinhood Stock Tokens (see docs.robinhood.com/chain).
  */
+/**
+ * Equity legs for Growth. Order = preference when routes tie.
+ * TSLA first: only name with live WETH multi-hop depth on RH V3 today
+ * (USDG→WETH→TSLA). Direct USDG/stock books are often empty.
+ */
 export const GROWTH_CANDIDATES: GrowthCandidate[] = [
-  {
-    id: 'nvda',
-    label: 'broad tech A',
-    token: '0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC' as Address,
-    decimals: 18,
-    pair: envPair('VITE_GROWTH_PAIR_NVDA'),
-  },
   {
     id: 'tsla',
     label: 'broad tech B',
     token: '0x322F0929c4625eD5bAd873c95208D54E1c003b2d' as Address,
     decimals: 18,
     pair: envPair('VITE_GROWTH_PAIR_TSLA'),
+  },
+  {
+    id: 'nvda',
+    label: 'broad tech A',
+    token: '0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC' as Address,
+    decimals: 18,
+    pair: envPair('VITE_GROWTH_PAIR_NVDA'),
   },
   {
     id: 'aapl',
