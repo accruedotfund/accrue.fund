@@ -454,9 +454,39 @@ p {
   color: var(--paper-raised);
 }
 
+/* Multi-line pay method rows: force light type on selected dark brand fill.
+   .muted / .figure would otherwise keep soft ink (unreadable on green). */
+.presets button[aria-pressed='true'] .muted,
+.presets button[aria-pressed='true'] .figure,
+.presets button[aria-pressed='true'] .small {
+  color: var(--paper-raised);
+}
+
+.presets button[aria-pressed='true'] .muted,
+.presets button[aria-pressed='true'] .small.muted {
+  opacity: 0.88;
+}
+
 .presets button:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* Stacked pay-method list (Fund screen) */
+.pay-options {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.pay-options button {
+  flex: none;
+  text-align: left;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-weight: 500;
 }
 
 /* ---- misc states ---- */

@@ -367,10 +367,9 @@ export default function Fund({
           <div className="field">
             <label id="pay-how">How do you want to pay?</label>
             <div
-              className="presets"
+              className="presets pay-options"
               role="radiogroup"
               aria-labelledby="pay-how"
-              style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}
             >
               {PAY_METHODS.map((m) => (
                 <button
@@ -380,13 +379,6 @@ export default function Fund({
                   aria-checked={payMethod === m.id}
                   aria-pressed={payMethod === m.id}
                   onClick={() => setPayMethod(m.id)}
-                  style={{
-                    textAlign: 'left',
-                    padding: '12px 14px',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 4,
-                  }}
                 >
                   <span className="figure" style={{ fontSize: '1rem' }}>
                     {m.label}
