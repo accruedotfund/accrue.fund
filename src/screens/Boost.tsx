@@ -84,9 +84,25 @@ export default function Boost({
           ? cause.message
           : 'Boost did not change. Your existing balance is untouched.'
       // Uniswap reverts are unreadable — surface the human copy we throw above.
-      const msg = /INSUFFICIENT_[AB]_AMOUNT/i.test(raw)
+      let msg = /INSUFFICIENT_[AB]_AMOUNT/i.test(raw)
         ? 'Boost liquidity slipped (pool too thin or price moved). Try again or keep funds in Standard.'
         : raw
+      // ensureRhGas tags Base top-up needs — strip protocol prefix for humans.
+      if (msg.startsWith('GAS_TOPUP_NEEDED:')) {
+        msg = msg.replace(
+          /^GAS_TOPUP_NEEDED:0x[a-fA-F0-9]{40}:/,
+          '',
+        ).trim()
+      }
+      if (
+        /insufficient funds|gas required|intrinsic gas|network fee|sponsor/i.test(
+          msg,
+        ) &&
+        !/Base ETH|Send ETH|top up|top-up/i.test(msg)
+      ) {
+        msg =
+          'Need a little ETH on Base for network fees (~$0.30+). Send it to your Accrue address, then try Steady again. Your dollars are safe.'
+      }
       setError(msg)
     } finally {
       setBusyId(null)

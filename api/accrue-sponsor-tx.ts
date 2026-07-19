@@ -9,8 +9,9 @@
  *   transaction: { to, data?, value? }  // value as decimal string or 0x hex
  * }
  *
- * Uses PRIVY_APP_SECRET (server-only) so App-pays sponsorship works when the
- * client SDK returns "App secret is required for gas sponsored transactions".
+ * Privy embedded wallets require a privy-authorization-signature on
+ * POST /v1/wallets/{id}/rpc. We use @privy-io/node with the user's JWT so the
+ * SDK exchanges it for a user signing key and attaches the header.
  *
  * Env (Vercel Production — never VITE_*):
  *   PRIVY_APP_ID (or VITE_PRIVY_APP_ID)
@@ -18,11 +19,11 @@
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node'
+import { PrivyClient, APIError } from '@privy-io/node'
 
 const PRIVY_APP_ID =
   process.env.PRIVY_APP_ID || process.env.VITE_PRIVY_APP_ID || ''
 const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET || ''
-const PRIVY_API = 'https://api.privy.io'
 
 type Body = {
   walletId?: string
@@ -42,6 +43,30 @@ function toHexQuantity(value: string | undefined): string | undefined {
   } catch {
     return undefined
   }
+}
+
+function isTxHash(h: string): boolean {
+  return /^0x[a-fA-F0-9]{64}$/.test(h)
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+function privyErrorMessage(err: unknown): string {
+  if (err instanceof APIError) {
+    const body = err.error as { error?: string; message?: string } | string | null
+    if (typeof body === 'string' && body.trim()) return body
+    if (body && typeof body === 'object') {
+      if (typeof body.error === 'string' && body.error.trim()) return body.error
+      if (typeof body.message === 'string' && body.message.trim()) {
+        return body.message
+      }
+    }
+    return err.message || `Privy error ${err.status}`
+  }
+  if (err instanceof Error) return err.message
+  return 'sponsor request failed'
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -64,12 +89,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
   if (!token) return res.status(401).json({ error: 'missing bearer token' })
 
+  const privy = new PrivyClient({
+    appId: PRIVY_APP_ID,
+    appSecret: PRIVY_APP_SECRET,
+  })
+
   let userId: string
   try {
-    const { PrivyClient } = await import('@privy-io/server-auth')
-    const privy = new PrivyClient(PRIVY_APP_ID, PRIVY_APP_SECRET)
-    const claims = await privy.verifyAuthToken(token)
-    userId = claims.userId
+    const claims = await privy.utils().auth().verifyAccessToken(token)
+    userId = claims.user_id
   } catch {
     return res.status(401).json({ error: 'invalid session' })
   }
@@ -96,96 +124,94 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // Confirm wallet is linked to this user (best-effort).
   try {
-    const { PrivyClient } = await import('@privy-io/server-auth')
-    const privy = new PrivyClient(PRIVY_APP_ID, PRIVY_APP_SECRET)
-    const user = await privy.getUserById(userId)
-    const accounts = user.linkedAccounts || []
-    const owns = accounts.some((a) => {
-      if (a.type !== 'wallet') return false
-      const w = a as { id?: string; address?: string }
+    const user = await privy.users()._get(userId)
+    const accounts = user.linked_accounts || []
+    const ownsId = accounts.some((a) => {
+      const w = a as { type?: string; id?: string }
       return (
-        w.id === walletId ||
-        (w.address && w.address.toLowerCase() === to.toLowerCase())
+        (w.type === 'wallet' || w.type === 'smart_wallet') &&
+        w.id === walletId
       )
     })
-    // Also match when `to` is Relay deposit (not the user wallet) — check id only
-    const ownsId = accounts.some((a) => {
-      if (a.type !== 'wallet') return false
-      return (a as { id?: string }).id === walletId
-    })
-    if (!owns && !ownsId) {
-      return res.status(403).json({ error: 'wallet not on this account' })
+    if (!ownsId) {
+      // Some linked-wallet shapes omit id — Privy still rejects bad walletId.
     }
   } catch {
     // If user fetch fails, still try send — Privy will reject bad walletId
   }
 
-  const basic = Buffer.from(`${PRIVY_APP_ID}:${PRIVY_APP_SECRET}`).toString(
-    'base64',
-  )
-
-  const rpcBody = {
-    method: 'eth_sendTransaction',
-    caip2,
-    chain_type: 'ethereum',
-    sponsor: true,
-    params: {
-      transaction: {
-        to,
-        ...(valueHex ? { value: valueHex } : {}),
-        ...(data ? { data } : {}),
-      },
-    },
-  }
+  const chainId = Number(caip2.split(':')[1])
+  const authorization_context = { user_jwts: [token] }
 
   try {
-    const rpcRes = await fetch(
-      `${PRIVY_API}/v1/wallets/${encodeURIComponent(walletId)}/rpc`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Basic ${basic}`,
-          'privy-app-id': PRIVY_APP_ID,
-          'content-type': 'application/json',
+    const result = await privy.wallets().ethereum().sendTransaction(walletId, {
+      caip2: caip2 as `eip155:${string}`,
+      sponsor: true,
+      authorization_context,
+      params: {
+        transaction: {
+          to,
+          ...(valueHex ? { value: valueHex } : {}),
+          ...(data ? { data } : {}),
+          ...(Number.isFinite(chainId) ? { chain_id: chainId } : {}),
         },
-        body: JSON.stringify(rpcBody),
       },
-    )
-    const rpcJson = (await rpcRes.json().catch(() => ({}))) as Record<
-      string,
-      unknown
-    >
+    })
 
-    if (!rpcRes.ok) {
-      const errMsg =
-        (rpcJson.error as { message?: string } | string | undefined) ||
-        rpcJson.message ||
-        `Privy sponsor ${rpcRes.status}`
-      const message =
-        typeof errMsg === 'string'
-          ? errMsg
-          : errMsg?.message || JSON.stringify(errMsg)
-      return res.status(502).json({ error: message, status: rpcRes.status })
+    let hash = String(result.hash || '')
+    const txId = result.transaction_id
+
+    // Sponsored user-ops often return empty hash until confirmed — poll by id.
+    if (!isTxHash(hash) && txId) {
+      for (let i = 0; i < 40; i++) {
+        try {
+          const tx = await privy.transactions().get(txId)
+          if (tx.transaction_hash && isTxHash(tx.transaction_hash)) {
+            hash = tx.transaction_hash
+            break
+          }
+          if (
+            tx.status === 'failed' ||
+            tx.status === 'execution_reverted' ||
+            tx.status === 'provider_error'
+          ) {
+            return res.status(502).json({
+              error: `Sponsored transaction ${tx.status}`,
+              status: tx.status,
+              transaction_id: txId,
+            })
+          }
+        } catch {
+          // keep polling
+        }
+        await sleep(750)
+      }
     }
 
-    // Response shapes vary: { data: { hash } } | { hash } | { data: { transaction_hash } }
-    const dataObj = (rpcJson.data || rpcJson) as Record<string, unknown>
-    const hash = String(
-      dataObj.hash ||
-        dataObj.transaction_hash ||
-        dataObj.transactionHash ||
-        '',
-    )
-    if (!/^0x[a-fA-F0-9]{64}$/.test(hash)) {
+    if (!isTxHash(hash)) {
       return res.status(502).json({
-        error: 'Sponsored send returned no hash',
-        raw: rpcJson,
+        error: 'Sponsored send returned no hash yet',
+        transaction_id: txId || null,
+        user_operation_hash: result.user_operation_hash || null,
       })
     }
 
-    return res.status(200).json({ hash, sponsored: true })
+    return res.status(200).json({
+      hash,
+      sponsored: true,
+      transaction_id: txId || null,
+    })
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'sponsor request failed'
-    return res.status(502).json({ error: msg })
+    const message = privyErrorMessage(err)
+    const status =
+      err instanceof APIError && err.status >= 400 && err.status < 600
+        ? err.status
+        : 502
+    // Map upstream 4xx to 502 so the client treats it as sponsor failure
+    // (and can fall through to self-pay), but keep the real Privy message.
+    return res.status(status === 401 || status === 403 ? 502 : status >= 500 ? status : 502).json({
+      error: message,
+      status: err instanceof APIError ? err.status : undefined,
+    })
   }
 }

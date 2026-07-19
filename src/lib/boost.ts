@@ -603,13 +603,16 @@ async function enterSteady(
   if (total < 10n ** 4n) throw new Error('Balance too small to boost')
   const half = total / 2n
 
-  // Too many shares → redeem excess into cash
+  // Too many shares → redeem excess into cash (skip dust — high NAV / tiny float)
+  const DUST_ASSETS = 10n ** 2n // 0.0001 USDG @ 6 decimals
   if (shareAssets > half + 1n) {
     const excessAssets = shareAssets - half
     let toRedeem = await sharesOf(excessAssets)
     if (toRedeem === 0n) toRedeem = shareBal / 2n
     if (toRedeem > shareBal) toRedeem = shareBal
-    if (toRedeem > 0n) {
+    const redeemAssets =
+      toRedeem > 0n ? await assetsOf(toRedeem) : 0n
+    if (toRedeem > 0n && redeemAssets >= DUST_ASSETS) {
       await sendAndWait(send, {
         to: wrapper,
         data: encodeFunctionData({
@@ -622,15 +625,17 @@ async function enterSteady(
   } else if (cashBal > half + 1n) {
     // Too much cash → deposit excess into standard shares
     const excessCash = cashBal - half
-    await ensureAllowance(pool.cash, owner, wrapper, excessCash, send, progress)
-    await sendAndWait(send, {
-      to: wrapper,
-      data: encodeFunctionData({
-        abi: vaultAbi,
-        functionName: 'deposit',
-        args: [excessCash, owner],
-      }),
-    })
+    if (excessCash >= DUST_ASSETS) {
+      await ensureAllowance(pool.cash, owner, wrapper, excessCash, send, progress)
+      await sendAndWait(send, {
+        to: wrapper,
+        data: encodeFunctionData({
+          abi: vaultAbi,
+          functionName: 'deposit',
+          args: [excessCash, owner],
+        }),
+      })
+    }
   }
 
   cashBal = await tokenBalance(pool.cash, owner)
@@ -682,8 +687,10 @@ async function enterSteady(
         if (!again) {
           const m = e instanceof Error ? e.message : 'createPair failed'
           throw new Error(
-            /unknown reason|reverted/i.test(m)
-              ? 'Could not create Steady market. Check network fee and try again.'
+            /unknown reason|reverted|insufficient funds|gas|sponsor|network fee/i.test(
+              m,
+            )
+              ? 'Could not create Steady market. Need a little ETH on Base (~$0.30+) for network fees — send it to your Accrue address, then try again. Your dollars are safe.'
               : m,
           )
         }

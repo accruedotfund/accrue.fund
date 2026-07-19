@@ -118,11 +118,31 @@ function walletIdForAddress(
 
 function humanSendError(err: unknown, chainId: number): Error {
   const msg = err instanceof Error ? err.message : String(err ?? '')
+  if (
+    /privy-authorization-signature|authorization signature|missing_or_empty_authorization/i.test(
+      msg,
+    )
+  ) {
+    return new Error(
+      'Network fee sponsorship is misconfigured (wallet auth signature). Retry in a moment, or keep a little ETH on Base for gas.',
+    )
+  }
   if (/app secret is required|gas sponsored|PRIVY_APP_SECRET/i.test(msg)) {
     return new Error(
       chainId === CHAIN_ID
         ? 'Could not sponsor network fees on Robinhood. We can top up from Base ETH — try again. Your dollars are safe.'
         : 'Could not sponsor network fees. Set PRIVY_APP_SECRET on the server, or keep a little ETH on Base for gas.',
+    )
+  }
+  // Privy does not list Robinhood mainnet for app-pays gas — expect this often.
+  if (
+    chainId === CHAIN_ID &&
+    /not supported|unsupported chain|chain.*(not|unsupported)|sponsorship.*(not|unavailable|disabled)/i.test(
+      msg,
+    )
+  ) {
+    return new Error(
+      'Robinhood network fees can’t be sponsored. If you have ETH on Base, retry — we’ll move a tiny fee over. Your dollars are safe.',
     )
   }
   if (/insufficient funds|gas required|intrinsic gas/i.test(msg)) {
@@ -195,9 +215,9 @@ function PrivyBridge({ children }: { children: ReactNode }) {
     () => async (tx: TransactionRequest): Promise<Hash> => {
       if (!embeddedWallet) throw new Error('Your account is not ready.')
       const chainId = tx.chainId ?? CHAIN_ID
-      // Want sponsorship by default on Base (low friction). RH: still try server
-      // sponsor; client sponsor rarely works there.
-      const wantSponsor = tx.sponsor !== false
+      // Privy app-pays lists Base, not Robinhood mainnet (4663). Only sponsor Base.
+      const wantSponsor =
+        tx.sponsor !== false && chainId === BASE_CHAIN_ID
 
       const sendClient = async (useSponsor: boolean) => {
         await embeddedWallet.switchChain(chainId)
@@ -218,8 +238,8 @@ function PrivyBridge({ children }: { children: ReactNode }) {
 
       const walletId = walletIdForAddress(user, embeddedWallet.address)
 
-      // 1) Client-sponsored (works when Privy “Allow from client” is on)
-      if (wantSponsor && chainId === BASE_CHAIN_ID) {
+      // 1) Client-sponsored on Base when Privy allows it
+      if (wantSponsor) {
         try {
           const result = await sendClient(true)
           return result.hash as Hash
@@ -233,7 +253,8 @@ function PrivyBridge({ children }: { children: ReactNode }) {
         }
       }
 
-      // 2) Server-sponsored with PRIVY_APP_SECRET
+      // 2) Server-sponsored Base only: PRIVY_APP_SECRET + user JWT auth signature
+      let sponsorErr: unknown
       if (wantSponsor && walletId) {
         try {
           return await sendSponsoredOnServer({
@@ -242,16 +263,27 @@ function PrivyBridge({ children }: { children: ReactNode }) {
             tx,
             getAccessToken,
           })
-        } catch {
-          // fall through to self-pay
+        } catch (err) {
+          sponsorErr = err
+          // fall through to self-pay (needs Base ETH)
         }
       }
 
-      // 3) Self-pay
+      // 3) Self-pay (RH Steady/createPair path — needs RH ETH via ensureRhGas)
       try {
         const result = await sendClient(false)
         return result.hash as Hash
       } catch (err) {
+        // Prefer the clearer sponsor failure when self-pay is just "no gas".
+        const selfMsg = err instanceof Error ? err.message : String(err ?? '')
+        if (
+          sponsorErr &&
+          /insufficient funds|gas required|intrinsic gas|app secret|sponsor|authorization/i.test(
+            selfMsg,
+          )
+        ) {
+          throw humanSendError(sponsorErr, chainId)
+        }
         throw humanSendError(err, chainId)
       }
     },
