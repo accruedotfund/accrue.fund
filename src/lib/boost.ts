@@ -386,9 +386,9 @@ export async function resolveSteadyPool(): Promise<ResolvedPool | null> {
 
 /**
  * Growth pool = USDG ↔ curated stock.
- * Prefer deepest liquid V2 pair. If none, bootstrap via Uniswap V3 (where
- * stock books live): pick first candidate with a V3 route so Turn on can
- * buy stock + seed/join our V2 Boost pair.
+ * Prefer deepest liquid V2 pair. Else first candidate with a V3 buy route so
+ * Turn on can BUY stock + create/seed our V2 Boost pair (we open it — we do
+ * not wait for someone else to pre-seed V2).
  */
 export async function resolveGrowthPool(): Promise<ResolvedPool | null> {
   const cash = CASH_TOKEN
@@ -431,12 +431,13 @@ export async function resolveGrowthPool(): Promise<ResolvedPool | null> {
             }
             continue
           }
-          // Thin / empty V2 pair — still usable if V3 can source the stock leg.
+          // Thin / empty Accrue V2 pair — still seedable via V3 buy.
         } catch {
           /* pair unreadable */
         }
       }
 
+      // Prefer first candidate that has ANY V3 path (NVDA is first in list).
       if (!bootstrap) {
         const v3ok = await hasV3Liquidity(cash, candidate.token)
         if (v3ok) {
@@ -459,6 +460,8 @@ export async function resolveGrowthPool(): Promise<ResolvedPool | null> {
       // skip unreachable candidates
     }
   }
+
+  // Always prefer a deep V2 if we found one; else bootstrap (create on Turn on).
   return best ?? bootstrap
 }
 
@@ -865,10 +868,12 @@ async function enterGrowth(
     usedV3 = true
   }
 
+  /** Cash spent on the risk-leg buy (for balanced first-seed LP). */
+  let cashSpentOnRisk = half
   if (usedV3) {
     try {
       // Sizes itself to book depth + estimateGas-safe max; may swap less than half.
-      await swapExactInV3({
+      const swapped = await swapExactInV3({
         tokenIn: pool.cash,
         tokenOut: pool.risk,
         amountIn: half,
@@ -877,6 +882,7 @@ async function enterGrowth(
         progress,
         slippageBps: 500n,
       })
+      cashSpentOnRisk = swapped.amountIn
     } catch (e) {
       const m = e instanceof Error ? e.message : String(e)
       if (
@@ -887,7 +893,7 @@ async function enterGrowth(
         throw e instanceof Error ? e : new Error(m)
       }
       throw new Error(
-        'Growth swap failed. Your dollars are still in your account — try Steady, or Growth later when stock books are deeper.',
+        'Growth swap failed. Your dollars are still in your account — try again in a moment.',
       )
     }
   }
@@ -899,7 +905,7 @@ async function enterGrowth(
     throw new Error('Growth swap returned nothing — market is unusable right now')
   }
 
-  // Ensure V2 pair exists so Boost can hold an LP receipt.
+  // Create Accrue’s V2 Growth pair if missing — this is “we open it.”
   let pair = await resolvePair(pool.cash, pool.risk, pool.candidate?.pair)
   if (!pair) {
     progress('Creating Growth market…')
@@ -927,12 +933,17 @@ async function enterGrowth(
   }
   if (!pair) throw new Error('Growth market did not open')
 
-  // Seed or join V2 at current reserves (empty → full bags).
+  // Seed/join V2. Empty pair: match cash leg to what we spent on stock so
+  // we don’t dump all free dollars into a dust-priced book.
   let amounts: { a: bigint; b: bigint }
   try {
     const sides = await readPairSides(pair, pool.cash)
     if (sides.cashReserve === 0n || sides.riskReserve === 0n) {
-      amounts = { a: cashLeft, b: riskGot }
+      const cashForLp =
+        cashSpentOnRisk > 0n && cashSpentOnRisk <= cashLeft
+          ? cashSpentOnRisk
+          : cashLeft
+      amounts = { a: cashForLp, b: riskGot }
     } else {
       amounts = optimalAmounts(
         cashLeft,
@@ -942,7 +953,11 @@ async function enterGrowth(
       )
     }
   } catch {
-    amounts = { a: cashLeft, b: riskGot }
+    const cashForLp =
+      cashSpentOnRisk > 0n && cashSpentOnRisk <= cashLeft
+        ? cashSpentOnRisk
+        : cashLeft
+    amounts = { a: cashForLp, b: riskGot }
   }
   if (amounts.a === 0n || amounts.b === 0n) {
     throw new Error(

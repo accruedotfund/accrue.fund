@@ -1,10 +1,10 @@
 // Uniswap V3 on Robinhood Chain — stock liquidity lives here, not V2.
 // Official RH deployments (developers.uniswap.org v3-robinhood-chain-deployments).
 //
-// RH stock books are often dust. We:
-//  - require a minimum pool USDG balance before advertising a route
-//  - cap swap size to what eth_estimateGas accepts (thin pools blow up estimate)
-//  - send via multicall + explicit gas so Privy/viem doesn’t choke on estimate
+// RH stock books are often dust. We still OPEN Growth when a route exists so
+// the first user can seed Accrue’s V2 Boost pair:
+//  - cap swap size to pool depth + estimateGas-safe max
+//  - send via multicall + explicit gas (thin books break bare estimateGas)
 
 import { encodeFunctionData, type Address } from 'viem'
 import type { TransactionRequest } from './auth'
@@ -26,8 +26,8 @@ export const V3_SWAP_ROUTER =
 /** Prefer tighter fees first (NVDA has a 1bps book). */
 const FEE_TIERS = [100, 500, 3000, 10000] as const
 
-/** Don’t open Growth against micro-dust books (units of 6-decimal cash). */
-export const MIN_V3_CASH_DEPTH = 2n * 10n ** 6n // $2 USDG in pool
+/** Any non-zero V3 liquidity is enough to attempt a seed swap. */
+const MIN_LIQ = 1n
 
 /** SwapRouter02 exactInputSingle needs a generous fixed gas on RH. */
 const SWAP_GAS = 450_000n
@@ -152,12 +152,14 @@ async function poolCashBalance(
   }
 }
 
-/** True if any fee tier has non-dust V3 liquidity for the pair. */
+/**
+ * True if we can buy tokenB with tokenA on V3 (any fee tier).
+ * Used to enable Growth Turn on so first users can seed our V2 Boost pair.
+ */
 export async function hasV3Liquidity(
   tokenA: Address,
   tokenB: Address,
 ): Promise<boolean> {
-  // tokenA is cash (USDG) for Growth
   for (const fee of FEE_TIERS) {
     try {
       const pool = await publicClient.readContract({
@@ -169,20 +171,22 @@ export async function hasV3Liquidity(
       if (!pool || pool === '0x0000000000000000000000000000000000000000') {
         continue
       }
-      const [liq, cash] = await Promise.all([
-        publicClient.readContract({
-          address: pool,
-          abi: poolAbi,
-          functionName: 'liquidity',
-        }),
-        poolCashBalance(pool, tokenA),
-      ])
-      if (liq > 0n && cash >= MIN_V3_CASH_DEPTH) return true
+      const liq = await publicClient.readContract({
+        address: pool,
+        abi: poolAbi,
+        functionName: 'liquidity',
+      })
+      if (liq >= MIN_LIQ) return true
+      // liq can read 0 while residual balances still quote
+      const cash = await poolCashBalance(pool, tokenA)
+      if (cash > 0n) return true
     } catch {
       /* try next fee */
     }
   }
-  return false
+  // Last resort: can we quote a micro buy?
+  const q = await quoteBestExactIn(tokenA, tokenB, 50_000n) // $0.05
+  return Boolean(q && q.amountOut > 0n)
 }
 
 export async function quoteBestExactIn(
@@ -336,10 +340,10 @@ export async function swapExactInV3({
     recipient,
     sized,
   )
-  if (maxEst < 50_000n) {
-    // <$0.05
+  if (maxEst < 10_000n) {
+    // <$0.01 — truly unusable
     throw new Error(
-      'Growth stock market is still too thin for Boost (almost no liquidity). Use Steady for now, or try Growth later when books fill.',
+      'Could not buy the Growth risk leg — external stock book has no room. Try again later.',
     )
   }
   sized = sized < maxEst ? sized : maxEst

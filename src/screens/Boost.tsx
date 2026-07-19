@@ -316,7 +316,7 @@ export default function Boost({
                   <p className="small muted">
                     {strategy.tier === 'steady'
                       ? 'Steady needs your dollar Standard account and network config. Open Standard / refresh, then try again.'
-                      : 'Growth stock markets are still too thin on-chain. Use Steady for now — Growth opens when books deepen.'}
+                      : 'Growth needs free dollars and a stock route. Add money or free balance from Steady, then try again.'}
                   </p>
                 )}
                 {!active && open === true && strategy.tier === 'steady' && (
@@ -327,8 +327,9 @@ export default function Boost({
                 )}
                 {!active && open === true && strategy.tier === 'growth' && (
                   <p className="small muted">
-                    Buys a market-linked leg on live stock books, then pools it.
-                    Needs free dollars. Higher risk.
+                    Turn on creates/seeds the Growth market from your free
+                    dollars (buys a market-linked leg, then pools it). Higher
+                    risk.
                   </p>
                 )}
 
