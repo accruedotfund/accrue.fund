@@ -223,6 +223,7 @@ export function optimalAmounts(
 export interface ResolvedPool {
   tier: BoostTier
   strategyId: string
+  /** Zero address when Steady has no pair yet — first LP creates it. */
   pair: Address
   cash: Address
   risk: Address
@@ -232,6 +233,8 @@ export interface ResolvedPool {
   totalSupply: bigint
   /** Growth only — which candidate won. */
   candidate?: GrowthCandidate
+  /** Steady first-LP: pair missing or empty. */
+  bootstrap?: boolean
 }
 
 async function readPairSides(
@@ -302,27 +305,67 @@ async function resolvePair(
   return pair
 }
 
-/** Steady pool = cash ↔ cash-wrapper when both exist and the pair has liquidity. */
+/**
+ * Steady = USDG ↔ wUSDG. Open whenever the standard vault exists.
+ * If the Uniswap pair is missing/empty, first "Turn on" seeds it via
+ * addLiquidity (router creates the pair). That is intentional bootstrap.
+ */
 export async function resolveSteadyPool(): Promise<ResolvedPool | null> {
   const cash = CASH_TOKEN
   const wrapper = await resolveUsdWrapper()
   if (!cash || !wrapper || !BOOST_ROUTER) return null
+
   const pair = await resolvePair(cash, wrapper, steadyPairOverride())
-  if (!pair) return null
-  const sides = await readPairSides(pair, cash)
-  if (!poolIsLiquid(sides.cashReserve, sides.riskReserve, CASH_DECIMALS)) {
-    return null
+  if (pair) {
+    try {
+      const sides = await readPairSides(pair, cash)
+      if (poolIsLiquid(sides.cashReserve, sides.riskReserve, CASH_DECIMALS)) {
+        return {
+          tier: 'steady',
+          strategyId: 'steady',
+          pair,
+          cash,
+          risk: wrapper,
+          riskDecimals: CASH_DECIMALS,
+          cashReserve: sides.cashReserve,
+          riskReserve: sides.riskReserve,
+          totalSupply: sides.totalSupply,
+        }
+      }
+      // Empty pair (0/0) — still bootstrappable
+      if (sides.totalSupply === 0n || (sides.cashReserve === 0n && sides.riskReserve === 0n)) {
+        return {
+          tier: 'steady',
+          strategyId: 'steady',
+          pair,
+          cash,
+          risk: wrapper,
+          riskDecimals: CASH_DECIMALS,
+          cashReserve: 0n,
+          riskReserve: 0n,
+          totalSupply: 0n,
+          bootstrap: true,
+        }
+      }
+      // Dust/junk pair — refuse
+      return null
+    } catch {
+      /* fall through to bootstrap without pair read */
+    }
   }
+
+  // No pair yet — first LP creates it.
   return {
     tier: 'steady',
     strategyId: 'steady',
-    pair,
+    pair: zeroAddress,
     cash,
     risk: wrapper,
     riskDecimals: CASH_DECIMALS,
-    cashReserve: sides.cashReserve,
-    riskReserve: sides.riskReserve,
-    totalSupply: sides.totalSupply,
+    cashReserve: 0n,
+    riskReserve: 0n,
+    totalSupply: 0n,
+    bootstrap: true,
   }
 }
 
@@ -495,11 +538,15 @@ async function enterSteady(
   const pool = await resolveSteadyPool()
   if (!pool) {
     throw new Error(
-      'Steady Boost isn’t open yet — the dollar liquidity pool still needs to be seeded.',
+      'Steady Boost isn’t ready — open Standard growth first, then try again.',
     )
   }
   const wrapper = await resolveUsdWrapper()
   if (!wrapper || !BOOST_ROUTER) throw new Error('Steady Boost is not configured')
+
+  // RH gas (sponsor → top-up from Base)
+  const { ensureRhGas } = await import('./gasBridge')
+  await ensureRhGas({ owner, send, progress })
 
   const [shares, cashBefore] = await Promise.all([
     tokenBalance(wrapper, owner),
@@ -511,7 +558,11 @@ async function enterSteady(
 
   // Prefer standard shares: redeem half into cash, LP cash + remaining shares.
   if (shares >= 2n) {
-    progress('Preparing equal parts of your balance…')
+    progress(
+      pool.bootstrap
+        ? 'Seeding Steady — splitting your balance…'
+        : 'Preparing equal parts of your balance…',
+    )
     await sendAndWait(send, {
       to: wrapper,
       data: encodeFunctionData({
@@ -532,20 +583,36 @@ async function enterSteady(
     throw new Error('The balance could not be prepared for Steady Boost')
   }
 
-  const sides = await readPairSides(pool.pair, pool.cash)
-  const amounts = optimalAmounts(
-    cashForBoost,
-    wrapperBal,
-    sides.cashReserve,
-    sides.riskReserve,
-  )
-  if (amounts.a === 0n || amounts.b === 0n) {
-    throw new Error('Steady position could not be sized — pool may be too thin')
+  // Bootstrap (empty/new pair): use full amounts. Live pool: match ratio.
+  let amounts: { a: bigint; b: bigint }
+  if (pool.bootstrap || pool.cashReserve === 0n || pool.riskReserve === 0n) {
+    amounts = { a: cashForBoost, b: wrapperBal }
+  } else {
+    const sides =
+      pool.pair !== zeroAddress
+        ? await readPairSides(pool.pair, pool.cash)
+        : { cashReserve: pool.cashReserve, riskReserve: pool.riskReserve }
+    amounts = optimalAmounts(
+      cashForBoost,
+      wrapperBal,
+      sides.cashReserve,
+      sides.riskReserve,
+    )
   }
+  if (amounts.a === 0n || amounts.b === 0n) {
+    throw new Error('Steady position could not be sized — need balance on both sides')
+  }
+
   await ensureAllowance(pool.cash, owner, BOOST_ROUTER, amounts.a, send, progress)
   await ensureAllowance(wrapper, owner, BOOST_ROUTER, amounts.b, send, progress)
-  progress('Turning on Steady Boost…')
-  // 5% slack — pool ratio moves slightly between quote and mint.
+  progress(
+    pool.bootstrap
+      ? 'Opening Steady pool and boosting…'
+      : 'Turning on Steady Boost…',
+  )
+  // First LP: mins 0. Later: 5% slack.
+  const minA = pool.bootstrap ? 0n : minAfterSlippage(amounts.a, 500n)
+  const minB = pool.bootstrap ? 0n : minAfterSlippage(amounts.b, 500n)
   await sendAndWait(send, {
     to: BOOST_ROUTER,
     data: encodeFunctionData({
@@ -556,8 +623,8 @@ async function enterSteady(
         wrapper,
         amounts.a,
         amounts.b,
-        minAfterSlippage(amounts.a, 500n),
-        minAfterSlippage(amounts.b, 500n),
+        minA,
+        minB,
         owner,
         deadline(),
       ],
@@ -576,6 +643,9 @@ async function enterGrowth(
       'Growth Boost isn’t open yet — no deep enough market pool is live. Check back soon.',
     )
   }
+
+  const { ensureRhGas } = await import('./gasBridge')
+  await ensureRhGas({ owner, send, progress })
 
   // Use free cash: half stays cash, half swaps into the risk leg.
   const { available, shares, wrapper } = await freeCashForBoost(owner)

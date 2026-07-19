@@ -148,8 +148,13 @@ export default function Boost({
                 {!active && open === false && (
                   <p className="small muted">
                     {strategy.tier === 'steady'
-                      ? 'Pool not seeded yet — Steady needs USDG ↔ standard liquidity on-chain.'
+                      ? 'Open Standard first, then Steady can turn on.'
                       : 'No deep Growth market live yet — we skip empty/dust pools.'}
+                  </p>
+                )}
+                {!active && open === true && strategy.tier === 'steady' && (
+                  <p className="small muted">
+                    First to turn on seeds the Steady pool from your balance.
                   </p>
                 )}
 
