@@ -775,7 +775,7 @@ async function enterGrowth(
   }
 
   const { ensureRhGas } = await import('./gasBridge')
-  const { quoteBestExactIn, swapExactInV3 } = await import('./uniswap-v3')
+  const { swapExactInV3 } = await import('./uniswap-v3')
   await ensureRhGas({ owner, send, progress })
 
   // Use free cash: half stays cash, half swaps into the risk leg.
@@ -866,14 +866,8 @@ async function enterGrowth(
   }
 
   if (usedV3) {
-    // Preflight: need a quote or we never open Growth against a dead book.
-    const probe = await quoteBestExactIn(pool.cash, pool.risk, half)
-    if (!probe) {
-      throw new Error(
-        'No live stock market to open Growth against. Try again later.',
-      )
-    }
     try {
+      // Sizes itself to book depth + estimateGas-safe max; may swap less than half.
       await swapExactInV3({
         tokenIn: pool.cash,
         tokenOut: pool.risk,
@@ -885,14 +879,15 @@ async function enterGrowth(
       })
     } catch (e) {
       const m = e instanceof Error ? e.message : String(e)
-      // Pass through already-human messages from swapExactInV3
       if (
-        /Growth swap|stock market|re-approve|Standard|Token approval/i.test(m)
+        /Growth|stock market|re-approve|Standard|Token approval|too thin|Steady/i.test(
+          m,
+        )
       ) {
         throw e instanceof Error ? e : new Error(m)
       }
       throw new Error(
-        'Growth swap failed. Your dollars are still in your account — try again in a moment.',
+        'Growth swap failed. Your dollars are still in your account — try Steady, or Growth later when stock books are deeper.',
       )
     }
   }

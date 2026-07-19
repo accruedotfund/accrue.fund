@@ -1,7 +1,13 @@
 // Uniswap V3 on Robinhood Chain — stock liquidity lives here, not V2.
 // Official RH deployments (developers.uniswap.org v3-robinhood-chain-deployments).
+//
+// RH stock books are often dust. We:
+//  - require a minimum pool USDG balance before advertising a route
+//  - cap swap size to what eth_estimateGas accepts (thin pools blow up estimate)
+//  - send via multicall + explicit gas so Privy/viem doesn’t choke on estimate
 
 import { encodeFunctionData, type Address } from 'viem'
+import type { TransactionRequest } from './auth'
 import {
   ensureAllowance,
   publicClient,
@@ -17,8 +23,14 @@ export const V3_QUOTER =
 export const V3_SWAP_ROUTER =
   '0xcaf681a66d020601342297493863e78c959e5cb2' as Address
 
-/** Prefer tighter fees first (NVDA has deep 1bps book). */
+/** Prefer tighter fees first (NVDA has a 1bps book). */
 const FEE_TIERS = [100, 500, 3000, 10000] as const
+
+/** Don’t open Growth against micro-dust books (units of 6-decimal cash). */
+export const MIN_V3_CASH_DEPTH = 2n * 10n ** 6n // $2 USDG in pool
+
+/** SwapRouter02 exactInputSingle needs a generous fixed gas on RH. */
+const SWAP_GAS = 450_000n
 
 const factoryAbi = [
   {
@@ -41,6 +53,16 @@ const poolAbi = [
     stateMutability: 'view',
     inputs: [],
     outputs: [{ type: 'uint128' }],
+  },
+] as const
+
+const erc20Abi = [
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'a', type: 'address' }],
+    outputs: [{ type: 'uint256' }],
   },
 ] as const
 
@@ -93,23 +115,49 @@ const swapRouterAbi = [
     ],
     outputs: [{ name: 'amountOut', type: 'uint256' }],
   },
+  {
+    type: 'function',
+    name: 'multicall',
+    stateMutability: 'payable',
+    inputs: [{ name: 'data', type: 'bytes[]' }],
+    outputs: [{ type: 'bytes[]' }],
+  },
 ] as const
 
 export type V3Route = {
   fee: number
   amountOut: bigint
   pool: Address
+  /** USDG (or tokenIn) balance sitting in the pool */
+  cashInPool: bigint
 }
 
 function minAfterBps(amount: bigint, bps: bigint): bigint {
   return (amount * (10_000n - bps)) / 10_000n
 }
 
-/** True if any fee tier has non-zero V3 liquidity for the pair. */
+async function poolCashBalance(
+  pool: Address,
+  cashToken: Address,
+): Promise<bigint> {
+  try {
+    return await publicClient.readContract({
+      address: cashToken,
+      abi: erc20Abi,
+      functionName: 'balanceOf',
+      args: [pool],
+    })
+  } catch {
+    return 0n
+  }
+}
+
+/** True if any fee tier has non-dust V3 liquidity for the pair. */
 export async function hasV3Liquidity(
   tokenA: Address,
   tokenB: Address,
 ): Promise<boolean> {
+  // tokenA is cash (USDG) for Growth
   for (const fee of FEE_TIERS) {
     try {
       const pool = await publicClient.readContract({
@@ -121,12 +169,15 @@ export async function hasV3Liquidity(
       if (!pool || pool === '0x0000000000000000000000000000000000000000') {
         continue
       }
-      const liq = await publicClient.readContract({
-        address: pool,
-        abi: poolAbi,
-        functionName: 'liquidity',
-      })
-      if (liq > 0n) return true
+      const [liq, cash] = await Promise.all([
+        publicClient.readContract({
+          address: pool,
+          abi: poolAbi,
+          functionName: 'liquidity',
+        }),
+        poolCashBalance(pool, tokenA),
+      ])
+      if (liq > 0n && cash >= MIN_V3_CASH_DEPTH) return true
     } catch {
       /* try next fee */
     }
@@ -134,9 +185,6 @@ export async function hasV3Liquidity(
   return false
 }
 
-/**
- * Best exact-in quote across fee tiers. Uses QuoterV2 simulate.
- */
 export async function quoteBestExactIn(
   tokenIn: Address,
   tokenOut: Address,
@@ -155,6 +203,7 @@ export async function quoteBestExactIn(
       if (!pool || pool === '0x0000000000000000000000000000000000000000') {
         continue
       }
+      const cashInPool = await poolCashBalance(pool, tokenIn)
       const { result } = await publicClient.simulateContract({
         address: V3_QUOTER,
         abi: quoterAbi,
@@ -172,18 +221,78 @@ export async function quoteBestExactIn(
       const amountOut = result[0]
       if (amountOut === 0n) continue
       if (!best || amountOut > best.amountOut) {
-        best = { fee, amountOut, pool }
+        best = { fee, amountOut, pool, cashInPool }
       }
     } catch {
-      /* empty / uninitialized tier */
+      /* empty tier */
     }
   }
   return best
 }
 
 /**
- * Approve router (if needed), re-quote, then exactInputSingle.
- * Retries once with a wider min-out if the first send reverts.
+ * Largest amountIn that RH eth_estimateGas accepts for this swap.
+ * Thin V3 books eth_call large swaps but estimateGas reverts past ~pool depth.
+ */
+export async function maxSwappableExactIn(
+  tokenIn: Address,
+  tokenOut: Address,
+  fee: number,
+  recipient: Address,
+  upperBound: bigint,
+): Promise<bigint> {
+  if (upperBound <= 0n) return 0n
+
+  const tryAmount = async (amountIn: bigint): Promise<boolean> => {
+    if (amountIn <= 0n) return false
+    const inner = encodeFunctionData({
+      abi: swapRouterAbi,
+      functionName: 'exactInputSingle',
+      args: [
+        {
+          tokenIn,
+          tokenOut,
+          fee,
+          recipient,
+          amountIn,
+          amountOutMinimum: 0n,
+          sqrtPriceLimitX96: 0n,
+        },
+      ],
+    })
+    const data = encodeFunctionData({
+      abi: swapRouterAbi,
+      functionName: 'multicall',
+      args: [[inner]],
+    })
+    try {
+      await publicClient.estimateGas({
+        account: recipient,
+        to: V3_SWAP_ROUTER,
+        data,
+      })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  // Fast path
+  if (await tryAmount(upperBound)) return upperBound
+  if (!(await tryAmount(1n))) return 0n
+
+  let lo = 1n
+  let hi = upperBound
+  while (lo + 1n < hi) {
+    const mid = (lo + hi) / 2n
+    if (await tryAmount(mid)) lo = mid
+    else hi = mid
+  }
+  return lo
+}
+
+/**
+ * Approve router, size to book depth, multicall exactInputSingle with fixed gas.
  */
 export async function swapExactInV3({
   tokenIn,
@@ -192,7 +301,6 @@ export async function swapExactInV3({
   recipient,
   send,
   progress,
-  /** Slippage in bps (default 5%). */
   slippageBps = 500n,
 }: {
   tokenIn: Address
@@ -202,106 +310,139 @@ export async function swapExactInV3({
   send: Sender
   progress?: Progress
   slippageBps?: bigint
-}): Promise<void> {
+}): Promise<{ amountIn: bigint; amountOutMin: bigint }> {
   const p = progress ?? (() => {})
   p('Balancing your Growth position…')
+
+  // Probe route at a tiny size first so we know fee tier + pool cash.
+  const probeSize = amountIn < 100_000n ? amountIn : 100_000n
+  let route = await quoteBestExactIn(tokenIn, tokenOut, probeSize)
+  if (!route) {
+    throw new Error(
+      'No live stock market quote right now. Try Steady, or check back later.',
+    )
+  }
+
+  // Cap to ~70% of cash sitting in the pool (estimateGas dies past thin depth).
+  const depthCap =
+    route.cashInPool > 0n ? (route.cashInPool * 70n) / 100n : amountIn
+  let sized = amountIn < depthCap ? amountIn : depthCap
+
+  // Further cap to what the node will estimateGas for.
+  const maxEst = await maxSwappableExactIn(
+    tokenIn,
+    tokenOut,
+    route.fee,
+    recipient,
+    sized,
+  )
+  if (maxEst < 50_000n) {
+    // <$0.05
+    throw new Error(
+      'Growth stock market is still too thin for Boost (almost no liquidity). Use Steady for now, or try Growth later when books fill.',
+    )
+  }
+  sized = sized < maxEst ? sized : maxEst
+
+  // Re-quote at final size
+  route = await quoteBestExactIn(tokenIn, tokenOut, sized)
+  if (!route || route.amountOut === 0n) {
+    throw new Error(
+      'Growth market quote failed at this size. Try a smaller balance or Steady.',
+    )
+  }
+
   await ensureAllowance(
     tokenIn,
     recipient,
     V3_SWAP_ROUTER,
-    amountIn,
+    sized,
     send,
     p,
   )
 
-  const attempt = async (bps: bigint) => {
-    const route = await quoteBestExactIn(tokenIn, tokenOut, amountIn)
-    if (!route) {
-      throw new Error(
-        'No live stock market quote right now. Try again in a moment.',
-      )
-    }
-    const amountOutMinimum = minAfterBps(route.amountOut, bps)
+  const amountOutMinimum = minAfterBps(route.amountOut, slippageBps)
+  const inner = encodeFunctionData({
+    abi: swapRouterAbi,
+    functionName: 'exactInputSingle',
+    args: [
+      {
+        tokenIn,
+        tokenOut,
+        fee: route.fee,
+        recipient,
+        amountIn: sized,
+        amountOutMinimum,
+        sqrtPriceLimitX96: 0n,
+      },
+    ],
+  })
+  // multicall is more reliable for estimateGas on RH than bare exactInputSingle
+  const data = encodeFunctionData({
+    abi: swapRouterAbi,
+    functionName: 'multicall',
+    args: [[inner]],
+  }) as `0x${string}`
 
-    // Dry-run as the user so we fail fast with a clear error.
-    try {
-      await publicClient.simulateContract({
-        account: recipient,
-        address: V3_SWAP_ROUTER,
-        abi: swapRouterAbi,
-        functionName: 'exactInputSingle',
-        args: [
-          {
-            tokenIn,
-            tokenOut,
-            fee: route.fee,
-            recipient,
-            amountIn,
-            amountOutMinimum,
-            sqrtPriceLimitX96: 0n,
-          },
-        ],
-      })
-    } catch (e) {
-      const m = e instanceof Error ? e.message : String(e)
-      if (/insufficient|allowance|STF|transfer/i.test(m)) {
-        throw new Error(
-          'Could not spend dollars for Growth — re-approve and try again.',
-        )
-      }
-      throw new Error(
-        'Growth swap would fail on-chain right now. Wait a second and retry.',
-      )
-    }
-
-    await sendAndWait(send, {
-      to: V3_SWAP_ROUTER,
-      data: encodeFunctionData({
-        abi: swapRouterAbi,
-        functionName: 'exactInputSingle',
-        args: [
-          {
-            tokenIn,
-            tokenOut,
-            fee: route.fee,
-            recipient,
-            amountIn,
-            amountOutMinimum,
-            sqrtPriceLimitX96: 0n,
-          },
-        ],
-      }),
-    })
+  const tx: TransactionRequest = {
+    to: V3_SWAP_ROUTER,
+    data,
+    gas: SWAP_GAS,
   }
 
   try {
-    await attempt(slippageBps)
+    await sendAndWait(send, tx)
   } catch (e) {
     const m = e instanceof Error ? e.message : String(e)
-    // Already humanized
-    if (
-      /No live stock|Could not spend|would fail on-chain|Token approval/i.test(
-        m,
-      )
-    ) {
-      throw e instanceof Error ? e : new Error(m)
-    }
-    // One retry with wider room (15%) after re-quote
-    p('Market moved — retrying Growth swap…')
-    try {
-      await attempt(1500n)
-    } catch (e2) {
-      const m2 = e2 instanceof Error ? e2.message : String(e2)
-      if (
-        /No live stock|Could not spend|would fail on-chain|Token approval/i.test(
-          m2,
-        )
-      ) {
-        throw e2 instanceof Error ? e2 : new Error(m2)
-      }
+    if (/insufficient funds|gas required|intrinsic gas/i.test(m)) {
       throw new Error(
-        'Growth swap failed after retry. Keep funds in Standard and try again in a moment.',
+        'Not enough Robinhood network fee for the Growth swap. Fund Base ETH and retry.',
+      )
+    }
+    if (/allowance|STF|transfer from/i.test(m)) {
+      throw new Error(
+        'Could not spend dollars for Growth — re-approve and try again.',
+      )
+    }
+    // One wider retry at 15% slip, same size
+    p('Market moved — retrying Growth swap…')
+    const route2 = await quoteBestExactIn(tokenIn, tokenOut, sized)
+    if (!route2) {
+      throw new Error(
+        'Growth swap failed. Stock market too thin — use Steady for now.',
+      )
+    }
+    const inner2 = encodeFunctionData({
+      abi: swapRouterAbi,
+      functionName: 'exactInputSingle',
+      args: [
+        {
+          tokenIn,
+          tokenOut,
+          fee: route2.fee,
+          recipient,
+          amountIn: sized,
+          amountOutMinimum: minAfterBps(route2.amountOut, 1500n),
+          sqrtPriceLimitX96: 0n,
+        },
+      ],
+    })
+    try {
+      await sendAndWait(send, {
+        to: V3_SWAP_ROUTER,
+        data: encodeFunctionData({
+          abi: swapRouterAbi,
+          functionName: 'multicall',
+          args: [[inner2]],
+        }) as `0x${string}`,
+        gas: SWAP_GAS,
+      })
+    } catch {
+      throw new Error(
+        'Growth stock market is too thin or moved. Your dollars are safe in your account — try Steady, or Growth later.',
       )
     }
   }
+
+  return { amountIn: sized, amountOutMin: amountOutMinimum }
 }

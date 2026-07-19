@@ -74,11 +74,12 @@ export interface TransactionRequest {
   to: Address
   data?: `0x${string}`
   value?: bigint
+  /** Explicit gas limit — set when eth_estimateGas is flaky (thin V3 swaps on RH). */
+  gas?: bigint
   /** Defaults to Robinhood (4663). Use BASE_CHAIN_ID for Base-only ops. */
   chainId?: number
   /**
    * Prefer gas sponsorship (default true on Base). Set false to force self-pay.
-   * Client → server sponsor API → self-pay.
    */
   sponsor?: boolean
 }
@@ -151,6 +152,7 @@ function PrivyBridge({ children }: { children: ReactNode }) {
             data: tx.data,
             value: tx.value,
             chainId,
+            ...(tx.gas != null ? { gas: tx.gas } : {}),
           },
           {
             address: embeddedWallet.address,

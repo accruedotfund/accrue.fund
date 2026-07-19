@@ -40,15 +40,16 @@ function humanBoostError(raw: string): string {
   if (/INSUFFICIENT_[AB]_AMOUNT/i.test(raw)) {
     return 'Boost liquidity slipped (pool too thin or price moved). Try again or keep funds in Standard.'
   }
-  if (/Growth swap|stock market|re-approve|buying the risk/i.test(raw)) {
-    return raw
+  if (
+    /Growth|stock market|re-approve|too thin|Steady for now|Token approval/i.test(
+      raw,
+    )
+  ) {
+    // Already product copy
+    return raw.replace(/^Error:\s*/i, '')
   }
-  if (/execution reverted|unknown reason/i.test(raw)) {
-    return 'That step failed on the network. Your dollars are still in your account — try Growth again in a moment.'
-  }
-  // Strip noisy viem dumps if any slip through
-  if (/Request Arguments:|Details: execution reverted/i.test(raw)) {
-    return 'That step failed on the network. Your dollars are still in your account — try again in a moment.'
+  if (/execution reverted|unknown reason|Request Arguments:/i.test(raw)) {
+    return 'That step failed on the network. Your dollars are still in your account — try again, or use Steady.'
   }
   return raw
 }
@@ -315,7 +316,7 @@ export default function Boost({
                   <p className="small muted">
                     {strategy.tier === 'steady'
                       ? 'Steady needs your dollar Standard account and network config. Open Standard / refresh, then try again.'
-                      : 'Growth needs a stock market route. Refresh in a moment — we’ll open one when a path is live.'}
+                      : 'Growth stock markets are still too thin on-chain. Use Steady for now — Growth opens when books deepen.'}
                   </p>
                 )}
                 {!active && open === true && strategy.tier === 'steady' && (
@@ -326,8 +327,8 @@ export default function Boost({
                 )}
                 {!active && open === true && strategy.tier === 'growth' && (
                   <p className="small muted">
-                    First to turn on seeds Growth from your dollars (buys a
-                    market-linked leg, then pools it). Higher risk.
+                    Buys a market-linked leg on live stock books, then pools it.
+                    Needs free dollars. Higher risk.
                   </p>
                 )}
 
