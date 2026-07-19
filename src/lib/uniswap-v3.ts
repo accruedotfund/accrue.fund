@@ -2,8 +2,13 @@
 // Official RH deployments (developers.uniswap.org v3-robinhood-chain-deployments).
 
 import { encodeFunctionData, type Address } from 'viem'
-import { publicClient, sendAndWait, type Progress, type Sender } from './vault'
-import { ensureAllowance } from './vault'
+import {
+  ensureAllowance,
+  publicClient,
+  sendAndWait,
+  type Progress,
+  type Sender,
+} from './vault'
 
 export const V3_FACTORY =
   '0x1f7d7550B1b028f7571E69A784071F0205FD2EfA' as Address
@@ -96,6 +101,10 @@ export type V3Route = {
   pool: Address
 }
 
+function minAfterBps(amount: bigint, bps: bigint): bigint {
+  return (amount * (10_000n - bps)) / 10_000n
+}
+
 /** True if any fee tier has non-zero V3 liquidity for the pair. */
 export async function hasV3Liquidity(
   tokenA: Address,
@@ -126,7 +135,7 @@ export async function hasV3Liquidity(
 }
 
 /**
- * Best exact-in quote across fee tiers. Uses QuoterV2 simulate (reverts with result).
+ * Best exact-in quote across fee tiers. Uses QuoterV2 simulate.
  */
 export async function quoteBestExactIn(
   tokenIn: Address,
@@ -172,44 +181,127 @@ export async function quoteBestExactIn(
   return best
 }
 
+/**
+ * Approve router (if needed), re-quote, then exactInputSingle.
+ * Retries once with a wider min-out if the first send reverts.
+ */
 export async function swapExactInV3({
   tokenIn,
   tokenOut,
   amountIn,
-  amountOutMinimum,
-  fee,
   recipient,
   send,
   progress,
+  /** Slippage in bps (default 5%). */
+  slippageBps = 500n,
 }: {
   tokenIn: Address
   tokenOut: Address
   amountIn: bigint
-  amountOutMinimum: bigint
-  fee: number
   recipient: Address
   send: Sender
   progress?: Progress
+  slippageBps?: bigint
 }): Promise<void> {
-  progress?.('Balancing your Growth position…')
-  await ensureAllowance(tokenIn, recipient, V3_SWAP_ROUTER, amountIn, send, progress ?? (() => {}))
-  // SwapRouter02 (periphery) exactInputSingle — no deadline field in this build
-  await sendAndWait(send, {
-    to: V3_SWAP_ROUTER,
-    data: encodeFunctionData({
-      abi: swapRouterAbi,
-      functionName: 'exactInputSingle',
-      args: [
-        {
-          tokenIn,
-          tokenOut,
-          fee,
-          recipient,
-          amountIn,
-          amountOutMinimum,
-          sqrtPriceLimitX96: 0n,
-        },
-      ],
-    }),
-  })
+  const p = progress ?? (() => {})
+  p('Balancing your Growth position…')
+  await ensureAllowance(
+    tokenIn,
+    recipient,
+    V3_SWAP_ROUTER,
+    amountIn,
+    send,
+    p,
+  )
+
+  const attempt = async (bps: bigint) => {
+    const route = await quoteBestExactIn(tokenIn, tokenOut, amountIn)
+    if (!route) {
+      throw new Error(
+        'No live stock market quote right now. Try again in a moment.',
+      )
+    }
+    const amountOutMinimum = minAfterBps(route.amountOut, bps)
+
+    // Dry-run as the user so we fail fast with a clear error.
+    try {
+      await publicClient.simulateContract({
+        account: recipient,
+        address: V3_SWAP_ROUTER,
+        abi: swapRouterAbi,
+        functionName: 'exactInputSingle',
+        args: [
+          {
+            tokenIn,
+            tokenOut,
+            fee: route.fee,
+            recipient,
+            amountIn,
+            amountOutMinimum,
+            sqrtPriceLimitX96: 0n,
+          },
+        ],
+      })
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e)
+      if (/insufficient|allowance|STF|transfer/i.test(m)) {
+        throw new Error(
+          'Could not spend dollars for Growth — re-approve and try again.',
+        )
+      }
+      throw new Error(
+        'Growth swap would fail on-chain right now. Wait a second and retry.',
+      )
+    }
+
+    await sendAndWait(send, {
+      to: V3_SWAP_ROUTER,
+      data: encodeFunctionData({
+        abi: swapRouterAbi,
+        functionName: 'exactInputSingle',
+        args: [
+          {
+            tokenIn,
+            tokenOut,
+            fee: route.fee,
+            recipient,
+            amountIn,
+            amountOutMinimum,
+            sqrtPriceLimitX96: 0n,
+          },
+        ],
+      }),
+    })
+  }
+
+  try {
+    await attempt(slippageBps)
+  } catch (e) {
+    const m = e instanceof Error ? e.message : String(e)
+    // Already humanized
+    if (
+      /No live stock|Could not spend|would fail on-chain|Token approval/i.test(
+        m,
+      )
+    ) {
+      throw e instanceof Error ? e : new Error(m)
+    }
+    // One retry with wider room (15%) after re-quote
+    p('Market moved — retrying Growth swap…')
+    try {
+      await attempt(1500n)
+    } catch (e2) {
+      const m2 = e2 instanceof Error ? e2.message : String(e2)
+      if (
+        /No live stock|Could not spend|would fail on-chain|Token approval/i.test(
+          m2,
+        )
+      ) {
+        throw e2 instanceof Error ? e2 : new Error(m2)
+      }
+      throw new Error(
+        'Growth swap failed after retry. Keep funds in Standard and try again in a moment.',
+      )
+    }
+  }
 }

@@ -99,6 +99,9 @@ export async function tokenBalance(token: Address, owner: Address) {
   })
 }
 
+/** Max approval — avoids exact-amount races between approve and spend. */
+const MAX_UINT256 = 2n ** 256n - 1n
+
 export async function ensureAllowance(
   token: Address,
   owner: Address,
@@ -107,7 +110,7 @@ export async function ensureAllowance(
   send: Sender,
   progress: Progress,
 ) {
-  const allowance = await publicClient.readContract({
+  let allowance = await publicClient.readContract({
     address: token,
     abi: erc20Abi,
     functionName: 'allowance',
@@ -115,14 +118,31 @@ export async function ensureAllowance(
   })
   if (allowance >= amount) return
   progress('Confirm access to this balance…')
+  // Some tokens require reset to 0 before raising; try max first.
   await sendAndWait(send, {
     to: token,
     data: encodeFunctionData({
       abi: erc20Abi,
       functionName: 'approve',
-      args: [spender, amount],
+      args: [spender, MAX_UINT256],
     }),
   })
+  // Confirm RPC sees the new allowance before the next spend tx.
+  for (let i = 0; i < 8; i++) {
+    allowance = await publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [owner, spender],
+    })
+    if (allowance >= amount) return
+    await new Promise((r) => setTimeout(r, 400))
+  }
+  if (allowance < amount) {
+    throw new Error(
+      'Token approval did not land. Wait a second and try again.',
+    )
+  }
 }
 
 export async function depositAvailable(

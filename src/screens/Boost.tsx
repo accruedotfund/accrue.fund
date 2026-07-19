@@ -15,10 +15,42 @@ import { STRATEGIES, type BoostStrategy, type BoostTier } from '../lib/strategie
 // Operate surface: two risk tiers. User never picks stocks or stables —
 // Steady is dollar-linked; Growth is equity-linked (engine picks the pool).
 
+/** Only real fee / gas shortages — never bare “Robinhood” (swap reverts include that). */
 function isGasError(msg: string): boolean {
-  return /Base ETH|network fee|top-up|top up|Robinhood|insufficient funds|gas required|intrinsic gas|sponsor|Accrue address|ETH on Base/i.test(
-    msg,
-  )
+  if (/GAS_TOPUP_NEEDED:/.test(msg)) return true
+  if (
+    /Base ETH|ETH on Base|Accrue address|top-up|top up|network fees? needed|sponsor network/i.test(
+      msg,
+    )
+  ) {
+    return true
+  }
+  // Intrinsic gas / empty wallet — not generic “execution reverted”
+  if (
+    /insufficient funds for gas|insufficient funds for transfer|gas required exceeds|intrinsic gas too low/i.test(
+      msg,
+    )
+  ) {
+    return true
+  }
+  return false
+}
+
+function humanBoostError(raw: string): string {
+  if (/INSUFFICIENT_[AB]_AMOUNT/i.test(raw)) {
+    return 'Boost liquidity slipped (pool too thin or price moved). Try again or keep funds in Standard.'
+  }
+  if (/Growth swap|stock market|re-approve|buying the risk/i.test(raw)) {
+    return raw
+  }
+  if (/execution reverted|unknown reason/i.test(raw)) {
+    return 'That step failed on the network. Your dollars are still in your account — try Growth again in a moment.'
+  }
+  // Strip noisy viem dumps if any slip through
+  if (/Request Arguments:|Details: execution reverted/i.test(raw)) {
+    return 'That step failed on the network. Your dollars are still in your account — try again in a moment.'
+  }
+  return raw
 }
 
 function AddressFundCard({
@@ -188,30 +220,24 @@ export default function Boost({
         cause instanceof Error
           ? cause.message
           : 'Boost did not change. Your existing balance is untouched.'
-      let msg = /INSUFFICIENT_[AB]_AMOUNT/i.test(raw)
-        ? 'Boost liquidity slipped (pool too thin or price moved). Try again or keep funds in Standard.'
-        : raw
 
-      const tagged = msg.match(
+      const tagged = raw.match(
         /^GAS_TOPUP_NEEDED:(0x[a-fA-F0-9]{40}):([\s\S]+)$/,
       )
+      let msg: string
       if (tagged) {
         msg = tagged[2]!.trim()
         setGasAddress(tagged[1]!)
         setFeeReady(false)
-      } else if (isGasError(msg)) {
-        if (
-          /insufficient funds|gas required|intrinsic gas|network fee|sponsor/i.test(
-            msg,
-          ) &&
-          !/Base ETH|Send ETH|top up|top-up|Accrue address/i.test(msg)
-        ) {
-          msg =
-            'Need a little ETH on Base for network fees (~$0.30+). Send it to the address below, then try Steady again. Your dollars are safe.'
-        }
+      } else if (isGasError(raw)) {
+        msg =
+          /Base ETH|ETH on Base|Accrue address|top-up|top up/i.test(raw)
+            ? raw
+            : 'Need a little ETH on Base for network fees (~$0.30+). Send it to the address below, then try again. Your dollars are safe.'
         setGasAddress(address)
         setFeeReady(false)
       } else {
+        msg = humanBoostError(raw)
         setGasAddress(null)
       }
       setError(msg)

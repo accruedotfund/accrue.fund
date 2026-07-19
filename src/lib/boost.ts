@@ -866,8 +866,9 @@ async function enterGrowth(
   }
 
   if (usedV3) {
-    const route = await quoteBestExactIn(pool.cash, pool.risk, half)
-    if (!route) {
+    // Preflight: need a quote or we never open Growth against a dead book.
+    const probe = await quoteBestExactIn(pool.cash, pool.risk, half)
+    if (!probe) {
       throw new Error(
         'No live stock market to open Growth against. Try again later.',
       )
@@ -877,20 +878,22 @@ async function enterGrowth(
         tokenIn: pool.cash,
         tokenOut: pool.risk,
         amountIn: half,
-        amountOutMinimum: minAfterSlippage(route.amountOut, 800n),
-        fee: route.fee,
         recipient: owner,
         send,
         progress,
+        slippageBps: 500n,
       })
     } catch (e) {
-      const m = e instanceof Error ? e.message : ''
-      if (/INSUFFICIENT|slippage|STF|Too little/i.test(m)) {
-        throw new Error(
-          'Growth market moved while buying the risk leg. Try again in a moment.',
-        )
+      const m = e instanceof Error ? e.message : String(e)
+      // Pass through already-human messages from swapExactInV3
+      if (
+        /Growth swap|stock market|re-approve|Standard|Token approval/i.test(m)
+      ) {
+        throw e instanceof Error ? e : new Error(m)
       }
-      throw e
+      throw new Error(
+        'Growth swap failed. Your dollars are still in your account — try again in a moment.',
+      )
     }
   }
 
@@ -1094,11 +1097,10 @@ export async function exitBoost(
         tokenIn: pool.risk,
         tokenOut: pool.cash,
         amountIn: riskFrom,
-        amountOutMinimum: minAfterSlippage(route.amountOut, 800n),
-        fee: route.fee,
         recipient: owner,
         send,
         progress,
+        slippageBps: 800n,
       })
     }
   }
