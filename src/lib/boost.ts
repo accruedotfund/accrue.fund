@@ -385,53 +385,81 @@ export async function resolveSteadyPool(): Promise<ResolvedPool | null> {
 }
 
 /**
- * Growth pool = deepest live USDG↔stock pair among curated candidates.
- * Returns null when nothing is liquid yet (UI shows "opening soon").
- * Skips dust/scam pairs (e.g. 1 wei risk reserve → INSUFFICIENT_B_AMOUNT).
+ * Growth pool = USDG ↔ curated stock.
+ * Prefer deepest liquid V2 pair. If none, bootstrap via Uniswap V3 (where
+ * stock books live): pick first candidate with a V3 route so Turn on can
+ * buy stock + seed/join our V2 Boost pair.
  */
 export async function resolveGrowthPool(): Promise<ResolvedPool | null> {
   const cash = CASH_TOKEN
   if (!cash || !BOOST_ROUTER) return null
 
+  const { hasV3Liquidity } = await import('./uniswap-v3')
+
   let best: ResolvedPool | null = null
   let bestScore = 0n
+  let bootstrap: ResolvedPool | null = null
 
   for (const candidate of GROWTH_CANDIDATES) {
     try {
       const pair = await resolvePair(cash, candidate.token, candidate.pair)
-      if (!pair) continue
-      const sides = await readPairSides(pair, cash)
-      if (
-        !poolIsLiquid(
-          sides.cashReserve,
-          sides.riskReserve,
-          candidate.decimals,
-        )
-      ) {
-        continue
+      if (pair) {
+        try {
+          const sides = await readPairSides(pair, cash)
+          if (
+            poolIsLiquid(
+              sides.cashReserve,
+              sides.riskReserve,
+              candidate.decimals,
+            )
+          ) {
+            const score = sides.cashReserve
+            if (score > bestScore) {
+              bestScore = score
+              best = {
+                tier: 'growth',
+                strategyId: 'growth',
+                pair,
+                cash,
+                risk: candidate.token,
+                riskDecimals: candidate.decimals,
+                cashReserve: sides.cashReserve,
+                riskReserve: sides.riskReserve,
+                totalSupply: sides.totalSupply,
+                candidate,
+              }
+            }
+            continue
+          }
+          // Thin / empty V2 pair — still usable if V3 can source the stock leg.
+        } catch {
+          /* pair unreadable */
+        }
       }
-      // Prefer deepest cash reserve (dollar depth for user-sized entries).
-      const score = sides.cashReserve
-      if (score > bestScore) {
-        bestScore = score
-        best = {
-          tier: 'growth',
-          strategyId: 'growth',
-          pair,
-          cash,
-          risk: candidate.token,
-          riskDecimals: candidate.decimals,
-          cashReserve: sides.cashReserve,
-          riskReserve: sides.riskReserve,
-          totalSupply: sides.totalSupply,
-          candidate,
+
+      if (!bootstrap) {
+        const v3ok = await hasV3Liquidity(cash, candidate.token)
+        if (v3ok) {
+          bootstrap = {
+            tier: 'growth',
+            strategyId: 'growth',
+            pair: pair ?? zeroAddress,
+            cash,
+            risk: candidate.token,
+            riskDecimals: candidate.decimals,
+            cashReserve: 0n,
+            riskReserve: 0n,
+            totalSupply: 0n,
+            candidate,
+            bootstrap: true,
+          }
         }
       }
     } catch {
       // skip unreachable candidates
     }
   }
-  return best
+  return best ?? bootstrap
 }
 
 export async function resolvePool(
@@ -742,11 +770,12 @@ async function enterGrowth(
   const pool = await resolveGrowthPool()
   if (!pool || !BOOST_ROUTER) {
     throw new Error(
-      'Growth Boost isn’t open yet — no deep enough market pool is live. Check back soon.',
+      'Growth Boost isn’t ready — no market route for stocks yet. Try again later.',
     )
   }
 
   const { ensureRhGas } = await import('./gasBridge')
+  const { quoteBestExactIn, swapExactInV3 } = await import('./uniswap-v3')
   await ensureRhGas({ owner, send, progress })
 
   // Use free cash: half stays cash, half swaps into the risk leg.
@@ -769,74 +798,154 @@ async function enterGrowth(
   // Need a real dollar amount (not dust).
   if (cash < 10n ** 5n) throw new Error('Fund your dollar account first')
 
-  // Cap swap at 3% of pool cash depth so we don’t blow up thin markets.
-  const maxSwap = pool.cashReserve / 33n
+  const deepV2 =
+    !pool.bootstrap &&
+    pool.pair !== zeroAddress &&
+    poolIsLiquid(pool.cashReserve, pool.riskReserve, pool.riskDecimals)
+
+  // Cap swap at 3% of V2 cash depth when joining a deep book.
+  const maxSwap = deepV2 ? pool.cashReserve / 33n : 0n
   let half = cash / 2n
   if (maxSwap > 0n && half > maxSwap) half = maxSwap
   if (half < 10n ** 4n) {
     throw new Error(
-      'Growth pool is too thin for this deposit size. Try a smaller amount later or use Standard for now.',
+      'Not enough balance to open Growth. Add dollars first.',
     )
   }
 
   progress('Balancing your Growth position…')
-  await ensureAllowance(pool.cash, owner, BOOST_ROUTER, half, send, progress)
-
-  const path = [pool.cash, pool.risk] as const
-  let expectedOut: bigint
-  try {
-    const quoted = await publicClient.readContract({
-      address: BOOST_ROUTER,
-      abi: routerAbi,
-      functionName: 'getAmountsOut',
-      args: [half, [...path]],
-    })
-    expectedOut = quoted[quoted.length - 1]!
-  } catch {
-    throw new Error('Growth market quote failed — pool may be empty')
-  }
-  if (expectedOut === 0n) throw new Error('Growth market has no liquidity')
-
   const riskBefore = await tokenBalance(pool.risk, owner)
-  try {
-    await sendAndWait(send, {
-      to: BOOST_ROUTER,
-      data: encodeFunctionData({
+
+  // Prefer V2 swap when that book is deep; else buy stock on Uniswap V3.
+  let usedV3 = false
+  if (deepV2) {
+    await ensureAllowance(pool.cash, owner, BOOST_ROUTER, half, send, progress)
+    const path = [pool.cash, pool.risk] as const
+    let expectedOut: bigint
+    try {
+      const quoted = await publicClient.readContract({
+        address: BOOST_ROUTER,
         abi: routerAbi,
-        functionName: 'swapExactTokensForTokens',
-        args: [
-          half,
-          minAfterSlippage(expectedOut, 500n),
-          [...path],
-          owner,
-          deadline(),
-        ],
-      }),
-    })
-  } catch (e) {
-    const m = e instanceof Error ? e.message : ''
-    if (/INSUFFICIENT|slippage|K\b/i.test(m)) {
+        functionName: 'getAmountsOut',
+        args: [half, [...path]],
+      })
+      expectedOut = quoted[quoted.length - 1]!
+    } catch {
+      expectedOut = 0n
+    }
+    if (expectedOut > 0n) {
+      try {
+        await sendAndWait(send, {
+          to: BOOST_ROUTER,
+          data: encodeFunctionData({
+            abi: routerAbi,
+            functionName: 'swapExactTokensForTokens',
+            args: [
+              half,
+              minAfterSlippage(expectedOut, 500n),
+              [...path],
+              owner,
+              deadline(),
+            ],
+          }),
+        })
+      } catch (e) {
+        const m = e instanceof Error ? e.message : ''
+        if (/INSUFFICIENT|slippage|K\b/i.test(m)) {
+          throw new Error(
+            'Growth market moved while swapping. Try again in a moment.',
+          )
+        }
+        throw e
+      }
+    } else {
+      usedV3 = true
+    }
+  } else {
+    usedV3 = true
+  }
+
+  if (usedV3) {
+    const route = await quoteBestExactIn(pool.cash, pool.risk, half)
+    if (!route) {
       throw new Error(
-        'Growth market moved while swapping. Try again in a moment.',
+        'No live stock market to open Growth against. Try again later.',
       )
     }
-    throw e
+    try {
+      await swapExactInV3({
+        tokenIn: pool.cash,
+        tokenOut: pool.risk,
+        amountIn: half,
+        amountOutMinimum: minAfterSlippage(route.amountOut, 800n),
+        fee: route.fee,
+        recipient: owner,
+        send,
+        progress,
+      })
+    } catch (e) {
+      const m = e instanceof Error ? e.message : ''
+      if (/INSUFFICIENT|slippage|STF|Too little/i.test(m)) {
+        throw new Error(
+          'Growth market moved while buying the risk leg. Try again in a moment.',
+        )
+      }
+      throw e
+    }
   }
+
   const riskAfter = await tokenBalance(pool.risk, owner)
   const riskGot = balanceIncrease(riskAfter, riskBefore)
   const cashLeft = await tokenBalance(pool.cash, owner)
   if (riskGot === 0n) {
-    throw new Error('Growth swap returned nothing — pool is unusable right now')
+    throw new Error('Growth swap returned nothing — market is unusable right now')
   }
 
-  // Re-read reserves after the swap (price moved).
-  const sides = await readPairSides(pool.pair, pool.cash)
-  const amounts = optimalAmounts(
-    cashLeft,
-    riskGot,
-    sides.cashReserve,
-    sides.riskReserve,
-  )
+  // Ensure V2 pair exists so Boost can hold an LP receipt.
+  let pair = await resolvePair(pool.cash, pool.risk, pool.candidate?.pair)
+  if (!pair) {
+    progress('Creating Growth market…')
+    try {
+      await sendAndWait(send, {
+        to: PAIR_FACTORY,
+        data: encodeFunctionData({
+          abi: factoryAbi,
+          functionName: 'createPair',
+          args: [pool.cash, pool.risk],
+        }),
+      })
+    } catch (e) {
+      pair = await resolvePair(pool.cash, pool.risk)
+      if (!pair) {
+        const m = e instanceof Error ? e.message : 'createPair failed'
+        throw new Error(
+          /gas|insufficient funds|network fee/i.test(m)
+            ? 'Could not create Growth market — need a little more network fee. Try again.'
+            : m,
+        )
+      }
+    }
+    pair = (await resolvePair(pool.cash, pool.risk)) ?? pair
+  }
+  if (!pair) throw new Error('Growth market did not open')
+
+  // Seed or join V2 at current reserves (empty → full bags).
+  let amounts: { a: bigint; b: bigint }
+  try {
+    const sides = await readPairSides(pair, pool.cash)
+    if (sides.cashReserve === 0n || sides.riskReserve === 0n) {
+      amounts = { a: cashLeft, b: riskGot }
+    } else {
+      amounts = optimalAmounts(
+        cashLeft,
+        riskGot,
+        sides.cashReserve,
+        sides.riskReserve,
+      )
+    }
+  } catch {
+    amounts = { a: cashLeft, b: riskGot }
+  }
   if (amounts.a === 0n || amounts.b === 0n) {
     throw new Error(
       'Growth position could not be sized — try again or use Standard for now.',
@@ -845,7 +954,12 @@ async function enterGrowth(
 
   await ensureAllowance(pool.cash, owner, BOOST_ROUTER, amounts.a, send, progress)
   await ensureAllowance(pool.risk, owner, BOOST_ROUTER, amounts.b, send, progress)
-  progress('Turning on Growth Boost…')
+  progress(
+    pool.bootstrap || usedV3
+      ? 'Seeding Growth with your balance…'
+      : 'Turning on Growth Boost…',
+  )
+  const softMins = pool.bootstrap || usedV3 || !deepV2
   try {
     await sendAndWait(send, {
       to: BOOST_ROUTER,
@@ -857,9 +971,8 @@ async function enterGrowth(
           pool.risk,
           amounts.a,
           amounts.b,
-          // Wider mins: after swap the ratio can still drift one block.
-          minAfterSlippage(amounts.a, 800n),
-          minAfterSlippage(amounts.b, 800n),
+          softMins ? 0n : minAfterSlippage(amounts.a, 800n),
+          softMins ? 0n : minAfterSlippage(amounts.b, 800n),
           owner,
           deadline(),
         ],
@@ -869,7 +982,7 @@ async function enterGrowth(
     const m = e instanceof Error ? e.message : ''
     if (/INSUFFICIENT_[AB]_AMOUNT/i.test(m)) {
       throw new Error(
-        'Growth liquidity mint slipped — market is too thin or moved. Try again, or keep funds in Standard.',
+        'Growth liquidity mint slipped — market moved. Try again, or keep funds in Standard.',
       )
     }
     throw e
@@ -938,33 +1051,56 @@ export async function exitBoost(
     return
   }
 
-  // Growth: sell risk leg back to cash, then park cash in standard if possible.
+  // Growth: sell risk leg back to cash (V2 if deep, else Uniswap V3).
   const riskAfter = await tokenBalance(pool.risk, owner)
   const riskFrom = balanceIncrease(riskAfter, riskBefore)
   if (riskFrom > 0n) {
     progress('Settling Growth back to dollars…')
-    await ensureAllowance(pool.risk, owner, BOOST_ROUTER, riskFrom, send, progress)
-    const path = [pool.risk, pool.cash] as const
-    let minOut = 0n
+    let sold = false
+    // Try V2 first
     try {
+      await ensureAllowance(pool.risk, owner, BOOST_ROUTER, riskFrom, send, progress)
+      const path = [pool.risk, pool.cash] as const
       const quoted = await publicClient.readContract({
         address: BOOST_ROUTER,
         abi: routerAbi,
         functionName: 'getAmountsOut',
         args: [riskFrom, [...path]],
       })
-      minOut = minAfterSlippage(quoted[quoted.length - 1]!)
+      const minOut = minAfterSlippage(quoted[quoted.length - 1]!)
+      if (minOut > 0n) {
+        await sendAndWait(send, {
+          to: BOOST_ROUTER,
+          data: encodeFunctionData({
+            abi: routerAbi,
+            functionName: 'swapExactTokensForTokens',
+            args: [riskFrom, minOut, [...path], owner, deadline()],
+          }),
+        })
+        sold = true
+      }
     } catch {
-      minOut = 0n
+      sold = false
     }
-    await sendAndWait(send, {
-      to: BOOST_ROUTER,
-      data: encodeFunctionData({
-        abi: routerAbi,
-        functionName: 'swapExactTokensForTokens',
-        args: [riskFrom, minOut, [...path], owner, deadline()],
-      }),
-    })
+    if (!sold) {
+      const { quoteBestExactIn, swapExactInV3 } = await import('./uniswap-v3')
+      const route = await quoteBestExactIn(pool.risk, pool.cash, riskFrom)
+      if (!route) {
+        throw new Error(
+          'Could not sell Growth risk leg back to dollars — keep the tokens or try later.',
+        )
+      }
+      await swapExactInV3({
+        tokenIn: pool.risk,
+        tokenOut: pool.cash,
+        amountIn: riskFrom,
+        amountOutMinimum: minAfterSlippage(route.amountOut, 800n),
+        fee: route.fee,
+        recipient: owner,
+        send,
+        progress,
+      })
+    }
   }
 
   const cashAfter = await tokenBalance(pool.cash, owner)

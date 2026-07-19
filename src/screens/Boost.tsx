@@ -289,13 +289,19 @@ export default function Boost({
                   <p className="small muted">
                     {strategy.tier === 'steady'
                       ? 'Steady needs your dollar Standard account and network config. Open Standard / refresh, then try again.'
-                      : 'No deep Growth market live yet — we skip empty/dust pools.'}
+                      : 'Growth needs a stock market route. Refresh in a moment — we’ll open one when a path is live.'}
                   </p>
                 )}
                 {!active && open === true && strategy.tier === 'steady' && (
                   <p className="small muted">
                     Dollar-linked pool. Turn on to seed or join with your
                     standard balance.
+                  </p>
+                )}
+                {!active && open === true && strategy.tier === 'growth' && (
+                  <p className="small muted">
+                    First to turn on seeds Growth from your dollars (buys a
+                    market-linked leg, then pools it). Higher risk.
                   </p>
                 )}
 
