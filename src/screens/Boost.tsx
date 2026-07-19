@@ -14,6 +14,12 @@ import { STRATEGIES, type BoostStrategy, type BoostTier } from '../lib/strategie
 // Operate surface: two risk tiers. User never picks stocks or stables —
 // Steady is dollar-linked; Growth is equity-linked (engine picks the pool).
 
+function isGasError(msg: string): boolean {
+  return /Base ETH|network fee|top-up|top up|Robinhood|insufficient funds|gas required|intrinsic gas|sponsor|Accrue address|ETH on Base/i.test(
+    msg,
+  )
+}
+
 export default function Boost({
   holdings,
   onRefresh,
@@ -26,6 +32,8 @@ export default function Boost({
   const [busyId, setBusyId] = useState<string | null>(null)
   const [status, setStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [gasAddress, setGasAddress] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
   const [steadyOpen, setSteadyOpen] = useState<boolean | null>(null)
   const [growthOpen, setGrowthOpen] = useState<boolean | null>(null)
 
@@ -61,15 +69,27 @@ export default function Boost({
     return positions.find((p) => p.tier === tier)
   }
 
+  async function copyGasAddress(addr: string) {
+    try {
+      await navigator.clipboard.writeText(addr)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      /* ignore */
+    }
+  }
+
   async function change(strategy: BoostStrategy, on: boolean) {
     if (!address || !walletReady) {
       setError('Your account is not ready yet.')
+      setGasAddress(null)
       return
     }
     setConfirming(null)
     setBusyId(strategy.id)
     setStatus('Preparing…')
     setError(null)
+    setGasAddress(null)
     try {
       if (on) {
         await enterBoost(strategy.tier, address, sendTransaction, setStatus)
@@ -87,21 +107,27 @@ export default function Boost({
       let msg = /INSUFFICIENT_[AB]_AMOUNT/i.test(raw)
         ? 'Boost liquidity slipped (pool too thin or price moved). Try again or keep funds in Standard.'
         : raw
-      // ensureRhGas tags Base top-up needs — strip protocol prefix for humans.
-      if (msg.startsWith('GAS_TOPUP_NEEDED:')) {
-        msg = msg.replace(
-          /^GAS_TOPUP_NEEDED:0x[a-fA-F0-9]{40}:/,
-          '',
-        ).trim()
-      }
-      if (
-        /insufficient funds|gas required|intrinsic gas|network fee|sponsor/i.test(
-          msg,
-        ) &&
-        !/Base ETH|Send ETH|top up|top-up/i.test(msg)
-      ) {
-        msg =
-          'Need a little ETH on Base for network fees (~$0.30+). Send it to your Accrue address, then try Steady again. Your dollars are safe.'
+
+      // ensureRhGas tags: GAS_TOPUP_NEEDED:0xaddr:detail
+      const tagged = msg.match(
+        /^GAS_TOPUP_NEEDED:(0x[a-fA-F0-9]{40}):([\s\S]+)$/,
+      )
+      if (tagged) {
+        msg = tagged[2]!.trim()
+        setGasAddress(tagged[1]!)
+      } else if (isGasError(msg)) {
+        if (
+          /insufficient funds|gas required|intrinsic gas|network fee|sponsor/i.test(
+            msg,
+          ) &&
+          !/Base ETH|Send ETH|top up|top-up|Accrue address/i.test(msg)
+        ) {
+          msg =
+            'Need a little ETH on Base for network fees (~$0.30+). Send it to the address below, then try Steady again. Your dollars are safe.'
+        }
+        setGasAddress(address)
+      } else {
+        setGasAddress(null)
       }
       setError(msg)
     } finally {
@@ -214,7 +240,48 @@ export default function Boost({
 
       {error && (
         <div className="notice" role="alert">
-          {error}
+          <p style={{ margin: 0 }}>{error}</p>
+          {gasAddress && (
+            <div style={{ marginTop: 12 }}>
+              <p className="small muted" style={{ margin: '0 0 6px' }}>
+                Your Accrue address — send a little <strong>ETH on Base</strong>{' '}
+                here:
+              </p>
+              <div
+                style={{
+                  display: 'flex',
+                  gap: 8,
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                }}
+              >
+                <code
+                  className="figure"
+                  style={{
+                    fontSize: '0.85rem',
+                    wordBreak: 'break-all',
+                    flex: 1,
+                    minWidth: 0,
+                  }}
+                  title={gasAddress}
+                >
+                  {gasAddress}
+                </code>
+                <button
+                  type="button"
+                  className="btn btn-quiet"
+                  style={{ width: 'auto', padding: '8px 12px', flexShrink: 0 }}
+                  onClick={() => void copyGasAddress(gasAddress)}
+                >
+                  {copied ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+              <p className="small muted" style={{ margin: '8px 0 0' }}>
+                Network: <strong>Base</strong> · not Ethereum mainnet · not
+                Robinhood. After it lands, turn Steady on again.
+              </p>
+            </div>
+          )}
         </div>
       )}
 
