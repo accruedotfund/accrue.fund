@@ -10,7 +10,8 @@ import {
   type Address,
   zeroAddress,
 } from 'viem'
-import { BOOST_ROUTER } from './rails'
+import { BOOST_ROUTER, setRailWrapper } from './rails'
+import { readUsdWrapper } from './factory'
 import {
   CASH_DECIMALS,
   CASH_TOKEN,
@@ -29,6 +30,37 @@ import {
   type Progress,
   type Sender,
 } from './vault'
+
+/** Refuse dust / scam-thin pools (TSLA pair had riskReserve = 1 wei). */
+const MIN_POOL_CASH = 100n * 10n ** 6n // $100 USDG
+/** 18-decimal risk legs: need real depth, not 1 wei. */
+const MIN_POOL_RISK_18 = 10n ** 15n // 0.001 token
+/** 6-decimal risk (wrapper): same $ idea. */
+const MIN_POOL_RISK_6 = 10n * 10n ** 6n // $10 of wUSDG
+
+export const minAfterSlippage = (amount: bigint, bps = 200n) =>
+  (amount * (10_000n - bps)) / 10_000n
+
+async function resolveUsdWrapper(): Promise<Address | undefined> {
+  const cached = cashWrapper()
+  if (cached) return cached
+  const onChain = await readUsdWrapper()
+  if (onChain) {
+    setRailWrapper('USD', onChain)
+    return onChain
+  }
+  return undefined
+}
+
+function poolIsLiquid(
+  cashReserve: bigint,
+  riskReserve: bigint,
+  riskDecimals: number,
+): boolean {
+  if (cashReserve < MIN_POOL_CASH) return false
+  if (riskDecimals <= 6) return riskReserve >= MIN_POOL_RISK_6
+  return riskReserve >= MIN_POOL_RISK_18
+}
 
 const pairAbi = [
   {
@@ -166,7 +198,6 @@ const routerAbi = [
   },
 ] as const
 
-export const minAfterSlippage = (amount: bigint) => (amount * 98n) / 100n
 const deadline = () => BigInt(Math.floor(Date.now() / 1000) + 20 * 60)
 
 export function balanceIncrease(after: bigint, before: bigint): bigint {
@@ -274,12 +305,14 @@ async function resolvePair(
 /** Steady pool = cash ↔ cash-wrapper when both exist and the pair has liquidity. */
 export async function resolveSteadyPool(): Promise<ResolvedPool | null> {
   const cash = CASH_TOKEN
-  const wrapper = cashWrapper()
+  const wrapper = await resolveUsdWrapper()
   if (!cash || !wrapper || !BOOST_ROUTER) return null
   const pair = await resolvePair(cash, wrapper, steadyPairOverride())
   if (!pair) return null
   const sides = await readPairSides(pair, cash)
-  if (sides.cashReserve === 0n || sides.riskReserve === 0n) return null
+  if (!poolIsLiquid(sides.cashReserve, sides.riskReserve, CASH_DECIMALS)) {
+    return null
+  }
   return {
     tier: 'steady',
     strategyId: 'steady',
@@ -296,6 +329,7 @@ export async function resolveSteadyPool(): Promise<ResolvedPool | null> {
 /**
  * Growth pool = deepest live USDG↔stock pair among curated candidates.
  * Returns null when nothing is liquid yet (UI shows "opening soon").
+ * Skips dust/scam pairs (e.g. 1 wei risk reserve → INSUFFICIENT_B_AMOUNT).
  */
 export async function resolveGrowthPool(): Promise<ResolvedPool | null> {
   const cash = CASH_TOKEN
@@ -309,7 +343,15 @@ export async function resolveGrowthPool(): Promise<ResolvedPool | null> {
       const pair = await resolvePair(cash, candidate.token, candidate.pair)
       if (!pair) continue
       const sides = await readPairSides(pair, cash)
-      if (sides.cashReserve === 0n || sides.riskReserve === 0n) continue
+      if (
+        !poolIsLiquid(
+          sides.cashReserve,
+          sides.riskReserve,
+          candidate.decimals,
+        )
+      ) {
+        continue
+      }
       // Prefer deepest cash reserve (dollar depth for user-sized entries).
       const score = sides.cashReserve
       if (score > bestScore) {
@@ -398,7 +440,7 @@ async function freeCashForBoost(owner: Address): Promise<{
   wrapper?: Address
 }> {
   const cash = CASH_TOKEN
-  const wrapper = cashWrapper()
+  const wrapper = await resolveUsdWrapper()
   if (!cash) throw new Error('Dollar account is not ready')
   const available = await tokenBalance(cash, owner)
   const shares = wrapper ? await tokenBalance(wrapper, owner) : 0n
@@ -451,8 +493,12 @@ async function enterSteady(
   progress: Progress,
 ) {
   const pool = await resolveSteadyPool()
-  if (!pool) throw new Error('Steady Boost is not open yet')
-  const wrapper = cashWrapper()
+  if (!pool) {
+    throw new Error(
+      'Steady Boost isn’t open yet — the dollar liquidity pool still needs to be seeded.',
+    )
+  }
+  const wrapper = await resolveUsdWrapper()
   if (!wrapper || !BOOST_ROUTER) throw new Error('Steady Boost is not configured')
 
   const [shares, cashBefore] = await Promise.all([
@@ -486,15 +532,20 @@ async function enterSteady(
     throw new Error('The balance could not be prepared for Steady Boost')
   }
 
+  const sides = await readPairSides(pool.pair, pool.cash)
   const amounts = optimalAmounts(
     cashForBoost,
     wrapperBal,
-    pool.cashReserve,
-    pool.riskReserve,
+    sides.cashReserve,
+    sides.riskReserve,
   )
+  if (amounts.a === 0n || amounts.b === 0n) {
+    throw new Error('Steady position could not be sized — pool may be too thin')
+  }
   await ensureAllowance(pool.cash, owner, BOOST_ROUTER, amounts.a, send, progress)
   await ensureAllowance(wrapper, owner, BOOST_ROUTER, amounts.b, send, progress)
   progress('Turning on Steady Boost…')
+  // 5% slack — pool ratio moves slightly between quote and mint.
   await sendAndWait(send, {
     to: BOOST_ROUTER,
     data: encodeFunctionData({
@@ -505,8 +556,8 @@ async function enterSteady(
         wrapper,
         amounts.a,
         amounts.b,
-        minAfterSlippage(amounts.a),
-        minAfterSlippage(amounts.b),
+        minAfterSlippage(amounts.a, 500n),
+        minAfterSlippage(amounts.b, 500n),
         owner,
         deadline(),
       ],
@@ -521,10 +572,12 @@ async function enterGrowth(
 ) {
   const pool = await resolveGrowthPool()
   if (!pool || !BOOST_ROUTER) {
-    throw new Error('Growth Boost is not open yet — check back soon')
+    throw new Error(
+      'Growth Boost isn’t open yet — no deep enough market pool is live. Check back soon.',
+    )
   }
 
-  // Use ~all free cash: half stays cash, half swaps into the risk leg.
+  // Use free cash: half stays cash, half swaps into the risk leg.
   const { available, shares, wrapper } = await freeCashForBoost(owner)
   let cash = available
   if (shares > 0n && wrapper) {
@@ -541,40 +594,68 @@ async function enterGrowth(
     cash = await tokenBalance(pool.cash, owner)
     if (cash <= before) throw new Error('Could not free balance for Growth')
   }
-  if (cash < 2n) throw new Error('Fund your dollar account first')
+  // Need a real dollar amount (not dust).
+  if (cash < 10n ** 5n) throw new Error('Fund your dollar account first')
 
-  const half = cash / 2n
+  // Cap swap at 3% of pool cash depth so we don’t blow up thin markets.
+  const maxSwap = pool.cashReserve / 33n
+  let half = cash / 2n
+  if (maxSwap > 0n && half > maxSwap) half = maxSwap
+  if (half < 10n ** 4n) {
+    throw new Error(
+      'Growth pool is too thin for this deposit size. Try a smaller amount later or use Standard for now.',
+    )
+  }
+
   progress('Balancing your Growth position…')
   await ensureAllowance(pool.cash, owner, BOOST_ROUTER, half, send, progress)
 
   const path = [pool.cash, pool.risk] as const
-  const quoted = await publicClient.readContract({
-    address: BOOST_ROUTER,
-    abi: routerAbi,
-    functionName: 'getAmountsOut',
-    args: [half, [...path]],
-  })
-  const expectedOut = quoted[quoted.length - 1]!
+  let expectedOut: bigint
+  try {
+    const quoted = await publicClient.readContract({
+      address: BOOST_ROUTER,
+      abi: routerAbi,
+      functionName: 'getAmountsOut',
+      args: [half, [...path]],
+    })
+    expectedOut = quoted[quoted.length - 1]!
+  } catch {
+    throw new Error('Growth market quote failed — pool may be empty')
+  }
   if (expectedOut === 0n) throw new Error('Growth market has no liquidity')
 
   const riskBefore = await tokenBalance(pool.risk, owner)
-  await sendAndWait(send, {
-    to: BOOST_ROUTER,
-    data: encodeFunctionData({
-      abi: routerAbi,
-      functionName: 'swapExactTokensForTokens',
-      args: [
-        half,
-        minAfterSlippage(expectedOut),
-        [...path],
-        owner,
-        deadline(),
-      ],
-    }),
-  })
+  try {
+    await sendAndWait(send, {
+      to: BOOST_ROUTER,
+      data: encodeFunctionData({
+        abi: routerAbi,
+        functionName: 'swapExactTokensForTokens',
+        args: [
+          half,
+          minAfterSlippage(expectedOut, 500n),
+          [...path],
+          owner,
+          deadline(),
+        ],
+      }),
+    })
+  } catch (e) {
+    const m = e instanceof Error ? e.message : ''
+    if (/INSUFFICIENT|slippage|K\b/i.test(m)) {
+      throw new Error(
+        'Growth market moved while swapping. Try again in a moment.',
+      )
+    }
+    throw e
+  }
   const riskAfter = await tokenBalance(pool.risk, owner)
   const riskGot = balanceIncrease(riskAfter, riskBefore)
   const cashLeft = await tokenBalance(pool.cash, owner)
+  if (riskGot === 0n) {
+    throw new Error('Growth swap returned nothing — pool is unusable right now')
+  }
 
   // Re-read reserves after the swap (price moved).
   const sides = await readPairSides(pool.pair, pool.cash)
@@ -585,29 +666,42 @@ async function enterGrowth(
     sides.riskReserve,
   )
   if (amounts.a === 0n || amounts.b === 0n) {
-    throw new Error('Growth position could not be sized')
+    throw new Error(
+      'Growth position could not be sized — try again or use Standard for now.',
+    )
   }
 
   await ensureAllowance(pool.cash, owner, BOOST_ROUTER, amounts.a, send, progress)
   await ensureAllowance(pool.risk, owner, BOOST_ROUTER, amounts.b, send, progress)
   progress('Turning on Growth Boost…')
-  await sendAndWait(send, {
-    to: BOOST_ROUTER,
-    data: encodeFunctionData({
-      abi: routerAbi,
-      functionName: 'addLiquidity',
-      args: [
-        pool.cash,
-        pool.risk,
-        amounts.a,
-        amounts.b,
-        minAfterSlippage(amounts.a),
-        minAfterSlippage(amounts.b),
-        owner,
-        deadline(),
-      ],
-    }),
-  })
+  try {
+    await sendAndWait(send, {
+      to: BOOST_ROUTER,
+      data: encodeFunctionData({
+        abi: routerAbi,
+        functionName: 'addLiquidity',
+        args: [
+          pool.cash,
+          pool.risk,
+          amounts.a,
+          amounts.b,
+          // Wider mins: after swap the ratio can still drift one block.
+          minAfterSlippage(amounts.a, 800n),
+          minAfterSlippage(amounts.b, 800n),
+          owner,
+          deadline(),
+        ],
+      }),
+    })
+  } catch (e) {
+    const m = e instanceof Error ? e.message : ''
+    if (/INSUFFICIENT_[AB]_AMOUNT/i.test(m)) {
+      throw new Error(
+        'Growth liquidity mint slipped — market is too thin or moved. Try again, or keep funds in Standard.',
+      )
+    }
+    throw e
+  }
 }
 
 export async function exitBoost(

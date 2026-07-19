@@ -79,11 +79,15 @@ export default function Boost({
       setStatus('Updating your balance…')
       await onRefresh()
     } catch (cause) {
-      setError(
+      const raw =
         cause instanceof Error
           ? cause.message
-          : 'Boost did not change. Your existing balance is untouched.',
-      )
+          : 'Boost did not change. Your existing balance is untouched.'
+      // Uniswap reverts are unreadable — surface the human copy we throw above.
+      const msg = /INSUFFICIENT_[AB]_AMOUNT/i.test(raw)
+        ? 'Boost liquidity slipped (pool too thin or price moved). Try again or keep funds in Standard.'
+        : raw
+      setError(msg)
     } finally {
       setBusyId(null)
       setStatus(null)
@@ -142,7 +146,11 @@ export default function Boost({
                 )}
 
                 {!active && open === false && (
-                  <p className="small muted">Opening soon</p>
+                  <p className="small muted">
+                    {strategy.tier === 'steady'
+                      ? 'Pool not seeded yet — Steady needs USDG ↔ standard liquidity on-chain.'
+                      : 'No deep Growth market live yet — we skip empty/dust pools.'}
+                  </p>
                 )}
 
                 {!active && open === null && (
