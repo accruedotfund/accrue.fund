@@ -18,12 +18,16 @@ import { publicClient, type Progress, type Sender } from './vault'
 const RELAY_QUOTE_URL =
   import.meta.env.VITE_RELAY_QUOTE_URL ?? 'https://api.relay.link/quote/v2'
 
-/** Enough for create + approve + deposit (RH gas is cheap). */
-const MIN_RH_WEI = parseEther('0.00005')
-/** Floor: ~$0.25–0.40 depending on ETH price — must be ≤ typical “$1 of ETH”. */
-const MIN_BRIDGE_WEI = parseEther('0.0001')
-/** Preferred top-up when they have more. */
-const PREFERRED_BRIDGE_WEI = parseEther('0.00025')
+/**
+ * Enough for Steady bootstrap on RH: createPair (~2.5M gas) + approves + addLiquidity.
+ * At ~0.06 gwei createPair alone is ~0.00015–0.00019 ETH — 0.00005 was far too low
+ * and left wallets “funded” but unable to create the Steady pair.
+ */
+const MIN_RH_WEI = parseEther('0.00035')
+/** Floor on Base before we attempt a Relay bridge (~$0.30+). */
+const MIN_BRIDGE_WEI = parseEther('0.00015')
+/** Preferred top-up when they have more Base ETH. */
+const PREFERRED_BRIDGE_WEI = parseEther('0.0005')
 
 const baseClient = createPublicClient({
   chain: base,
