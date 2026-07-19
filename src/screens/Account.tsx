@@ -1,8 +1,23 @@
 import { useState } from 'react'
 import { useAuth } from '../lib/auth'
+import { ensureUsdWrapper, readUsdWrapper } from '../lib/factory'
 import type { Holding } from '../lib/nav'
-import { formatMoney } from '../lib/rails'
+import { formatMoney, setRailWrapper } from '../lib/rails'
 import { depositAvailable, redeemStandard } from '../lib/vault'
+
+function humanMoveError(cause: unknown): string {
+  const msg = cause instanceof Error ? cause.message : String(cause ?? '')
+  if (/insufficient funds|gas required|intrinsic gas|out of gas/i.test(msg)) {
+    return 'Needs a tiny network fee on Robinhood Chain (ETH). Your dollars are safe as available — add a little ETH to that same address, then try again.'
+  }
+  if (/app secret|gas sponsored|sponsor/i.test(msg)) {
+    return 'Network fee couldn’t be sponsored here. Fund a little ETH on Robinhood for this address, then try again. Your available balance is untouched.'
+  }
+  if (/not configured/i.test(msg)) {
+    return 'Standard growth isn’t open on the network yet. We’ll open it once when you move balance (needs a tiny RH network fee).'
+  }
+  return msg || 'The balance did not move. Nothing was lost.'
+}
 
 export default function Account({
   holding,
@@ -17,6 +32,20 @@ export default function Account({
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  const needsVaultOpen = holding.rail.code === 'USD' && !holding.rail.wrapper
+
+  async function ensureStandardVault() {
+    // Discover existing wUSDG, or permissionless-create once (user pays RH gas).
+    let wrapper = await readUsdWrapper()
+    if (!wrapper) {
+      setBusy('Opening standard growth on the network…')
+      wrapper = await ensureUsdWrapper(sendTransaction, setBusy)
+    }
+    setRailWrapper('USD', wrapper)
+    holding.rail.wrapper = wrapper
+    return wrapper
+  }
+
   async function move(direction: 'grow' | 'available') {
     if (!address || !walletReady) {
       setError('Your account is not ready yet.')
@@ -26,6 +55,9 @@ export default function Account({
     setBusy('Preparing…')
     try {
       if (direction === 'grow') {
+        if (holding.rail.code === 'USD') {
+          await ensureStandardVault()
+        }
         await depositAvailable(holding.rail, address, sendTransaction, setBusy)
       } else {
         await redeemStandard(holding.rail, address, sendTransaction, setBusy)
@@ -33,11 +65,7 @@ export default function Account({
       setBusy('Updating your balance…')
       await onRefresh()
     } catch (cause) {
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : 'The balance did not move. Nothing was lost.',
-      )
+      setError(humanMoveError(cause))
     } finally {
       setBusy(null)
     }
@@ -109,7 +137,10 @@ export default function Account({
           disabled={Boolean(busy)}
           onClick={() => move('grow')}
         >
-          {busy ?? 'Move available balance to standard'}
+          {busy ??
+            (needsVaultOpen
+              ? 'Open standard growth & move balance'
+              : 'Move available balance to standard')}
         </button>
       )}
       {holding.standardBalance > 0 && (
@@ -123,8 +154,9 @@ export default function Account({
       )}
 
       <p className="small muted">
-        A small entry or exit charge stays in the standard account and increases
-        value per unit for everyone who remains.
+        {needsVaultOpen
+          ? 'Standard growth opens once on the network (tiny Robinhood network fee in ETH). After that, moving available → standard only needs the same fee for the deposit.'
+          : 'A small entry or exit charge stays in the standard account and increases value per unit for everyone who remains.'}
       </p>
     </div>
   )

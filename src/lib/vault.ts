@@ -131,7 +131,12 @@ export async function depositAvailable(
   send: Sender,
   progress: Progress,
 ) {
-  if (!rail.stable || !rail.wrapper) throw new Error('Account is not configured')
+  if (!rail.stable) throw new Error('This account is not set up for deposits yet')
+  if (!rail.wrapper) {
+    throw new Error(
+      'Standard growth is not open yet — open it once, then move your available balance.',
+    )
+  }
   const amount = await tokenBalance(rail.stable, owner)
   if (amount === 0n) throw new Error('No available balance')
   await ensureAllowance(rail.stable, owner, rail.wrapper, amount, send, progress)
@@ -152,7 +157,9 @@ export async function redeemStandard(
   send: Sender,
   progress: Progress,
 ) {
-  if (!rail.wrapper) throw new Error('Account is not configured')
+  if (!rail.wrapper) {
+    throw new Error('No standard balance on this account yet.')
+  }
   const shares = await tokenBalance(rail.wrapper, owner)
   if (shares === 0n) throw new Error('No standard balance')
   progress('Making your balance available…')
