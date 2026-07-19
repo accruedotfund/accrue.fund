@@ -81,9 +81,18 @@ export async function ensureRhGas({
     )
   }
 
-  // Bridge preferred amount, or everything they have if between min and preferred.
+  // Leave a sliver on Base for gas (self-pay — Privy client sponsor is unreliable).
+  const BASE_GAS_RESERVE = parseEther('0.00002')
+  const spendable =
+    onBase > BASE_GAS_RESERVE ? onBase - BASE_GAS_RESERVE : onBase
+  if (spendable < MIN_BRIDGE_WEI) {
+    throw new Error(
+      `GAS_TOPUP_NEEDED:${owner}:You have ${fmtEth(onBase)} ETH on Base — need a bit more so we can move network fee and still pay Base gas. Send ~$1 of ETH on Base to the address below, then try again. Your dollars are safe.`,
+    )
+  }
+  // Bridge preferred amount, or everything spendable if between min and preferred.
   const bridgeAmount =
-    onBase >= PREFERRED_BRIDGE_WEI ? PREFERRED_BRIDGE_WEI : onBase
+    spendable >= PREFERRED_BRIDGE_WEI ? PREFERRED_BRIDGE_WEI : spendable
 
   progress(
     `Moving ${fmtEth(bridgeAmount)} ETH from Base for network fees…`,
@@ -130,8 +139,8 @@ export async function ensureRhGas({
     | undefined
   // Prefer quote’s exact value (includes any fee encoding Relay expects).
   let value = item?.value ? BigInt(item.value) : bridgeAmount
-  // Never try to send more than the wallet holds.
-  if (value > onBase) value = onBase
+  // Never drain Base below gas reserve (self-pay Base fee).
+  if (value > spendable) value = spendable
 
   if (
     !step?.requestId ||
@@ -142,10 +151,12 @@ export async function ensureRhGas({
     throw new Error('Could not prepare network-fee top-up route.')
   }
 
+  // sponsor: false — user pays Base gas from remaining ETH (avoids Privy app-secret error).
   const hash = await send({
     to: depositAddress,
     value,
     chainId: BASE_CHAIN_ID,
+    sponsor: false,
   })
   const receipt = await baseClient.waitForTransactionReceipt({ hash })
   if (receipt.status !== 'success') {

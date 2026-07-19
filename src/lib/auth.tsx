@@ -24,7 +24,7 @@ import {
 import { base } from 'viem/chains'
 import { defineChain, type Hash } from 'viem'
 import type { Address } from 'viem'
-import { BASE_CHAIN_ID, CHAIN_ID, RH_RPC_URLS, RPC_URL } from './rails'
+import { CHAIN_ID, RH_RPC_URLS, RPC_URL } from './rails'
 
 const PRIVY_APP_ID = (import.meta.env.VITE_PRIVY_APP_ID as string | undefined)?.trim()
 const rawClientId = (import.meta.env.VITE_PRIVY_CLIENT_ID as string | undefined)?.trim()
@@ -75,6 +75,12 @@ export interface TransactionRequest {
   value?: bigint
   /** Defaults to Robinhood (4663). Use BASE_CHAIN_ID for Base-only ops. */
   chainId?: number
+  /**
+   * Privy App-pays sponsorship. Default false — client sponsorship often
+   * returns "App secret is required" unless dashboard "Allow from client" is
+   * on and the chain is supported. Prefer self-pay when the user has ETH.
+   */
+  sponsor?: boolean
 }
 
 export interface Session {
@@ -102,8 +108,8 @@ function humanSendError(err: unknown, chainId: number): Error {
   if (/app secret is required|gas sponsored/i.test(msg)) {
     return new Error(
       chainId === CHAIN_ID
-        ? 'Network fees on Robinhood are not covered by Privy sponsorship. Add money uses Base → Relay (no RH gas). Standard growth / withdraw need a tiny RH network fee — we’re not creating vaults with broken sponsorship.'
-        : 'Gas sponsorship failed on this network. Try again, or check Privy App pays + client allow for Base.',
+        ? 'Network fees on Robinhood are paid with your RH ETH (we can top up from Base). Your dollars are safe.'
+        : 'Could not use sponsored gas. Paying the network fee from your Base ETH instead if available.',
     )
   }
   if (/insufficient funds|gas required|intrinsic gas/i.test(msg)) {
@@ -134,12 +140,17 @@ function PrivyBridge({ children }: { children: ReactNode }) {
     () => async (tx: TransactionRequest): Promise<Hash> => {
       if (!embeddedWallet) throw new Error('Your account is not ready.')
       const chainId = tx.chainId ?? CHAIN_ID
-      // Privy native sponsorship: Base yes · Robinhood mainnet no (docs list
-      // only Robinhood Testnet). sponsor:true on 4663 → "App secret required".
-      const sponsor = chainId === BASE_CHAIN_ID
-      try {
+      // Default: self-pay. Client sponsor:true hits "App secret required" when
+      // Privy "Allow transactions from the client" is off / flaky — even on Base.
+      // Gas top-up sends native ETH so the wallet can pay Base gas itself.
+      let sponsor = tx.sponsor === true
+      if (chainId === CHAIN_ID) sponsor = false
+      // Native ETH transfers never need sponsorship if value covers gas from balance.
+      if (tx.value != null && tx.value > 0n && !tx.data) sponsor = false
+
+      const sendOnce = async (useSponsor: boolean) => {
         await embeddedWallet.switchChain(chainId)
-        const result = await sendPrivyTransaction(
+        return sendPrivyTransaction(
           {
             to: tx.to,
             data: tx.data,
@@ -148,12 +159,26 @@ function PrivyBridge({ children }: { children: ReactNode }) {
           },
           {
             address: embeddedWallet.address,
-            sponsor,
+            sponsor: useSponsor,
             uiOptions: { showWalletUIs: false },
           },
         )
+      }
+
+      try {
+        const result = await sendOnce(sponsor)
         return result.hash as Hash
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err ?? '')
+        // Retry once without sponsor if Privy demands app secret.
+        if (sponsor && /app secret is required|gas sponsored/i.test(msg)) {
+          try {
+            const result = await sendOnce(false)
+            return result.hash as Hash
+          } catch (retryErr) {
+            throw humanSendError(retryErr, chainId)
+          }
+        }
         throw humanSendError(err, chainId)
       }
     },
