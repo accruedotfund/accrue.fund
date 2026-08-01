@@ -140,20 +140,27 @@ export function recordSnapshot(
     })
   } else if (last && snap.total > last.total + INFER_MIN) {
     const delta = snap.total - last.total
-    // Deposit-shaped: ≥ ~min fund, or any jump when boost didn't dominate.
-    // Skip only if Fund already booked a matching flow.
+    // Deposit-shaped: ≥ ~min fund, or jump not explained by boost MTM alone.
     const already = flowCovers(ledger, 'in', delta, 5 * 60_000, now)
     const depositShaped = delta >= DEPOSIT_SHAPE
-    // Small bumps while boosted can be MTM — only book if deposit-shaped
-    // or available/standard legs drove the jump (proxy: boost delta small).
     const boostDelta = snap.boost - (last.boost ?? 0)
-    const capitalLike = depositShaped || boostDelta < delta * 0.5
+    const nonBoostDelta =
+      snap.available +
+      snap.standard -
+      ((last.available ?? 0) + (last.standard ?? 0))
+    // Capital in if big jump, or available/standard rose (relay deposit), or
+    // boost rise is less than half the total jump.
+    const capitalLike =
+      depositShaped ||
+      nonBoostDelta >= INFER_MIN ||
+      boostDelta < delta * 0.5
     if (!already && capitalLike) {
-      ledger.costBasis = round2(ledger.costBasis + delta)
+      const amount = round2(Math.max(delta, nonBoostDelta))
+      ledger.costBasis = round2(ledger.costBasis + amount)
       ledger.flows.push({
         t: now,
         kind: 'in',
-        amount: round2(delta),
+        amount,
         source: 'inferred',
       })
     }
@@ -173,12 +180,23 @@ export function recordSnapshot(
     }
   }
 
+  // Keep cost basis = sum of signed flows (source of truth).
+  ledger.costBasis = round2(sumFlows(ledger.flows))
+
   if (ledger.flows.length > MAX_FLOWS) {
     ledger.flows = ledger.flows.slice(-MAX_FLOWS)
   }
 
   save(ledger)
   return ledger
+}
+
+function sumFlows(flows: Flow[]): number {
+  let n = 0
+  for (const f of flows) {
+    n += f.kind === 'in' ? f.amount : -f.amount
+  }
+  return Math.max(0, n)
 }
 
 /** Explicit deposit (Fund success). Adds full amount to cost basis. */
@@ -192,11 +210,12 @@ export function recordDeposit(
   const now = Date.now()
   // Dedupe: Fund settle + poll may both fire for same dollars
   if (flowCovers(ledger, 'in', amount, 5 * 60_000, now)) {
+    ledger.costBasis = round2(sumFlows(ledger.flows))
     save(ledger)
     return
   }
-  ledger.costBasis = round2(ledger.costBasis + amount)
   ledger.flows.push({ t: now, kind: 'in', amount: round2(amount), source })
+  ledger.costBasis = round2(sumFlows(ledger.flows))
   if (ledger.flows.length > MAX_FLOWS) {
     ledger.flows = ledger.flows.slice(-MAX_FLOWS)
   }
@@ -220,18 +239,21 @@ export function recordWithdraw(
     currentTotal ??
     ledger.points[ledger.points.length - 1]?.total ??
     ledger.costBasis
-  if (total > 0 && ledger.costBasis > 0) {
-    const ratio = Math.min(1, amount / total)
-    ledger.costBasis = round2(Math.max(0, ledger.costBasis * (1 - ratio)))
-  } else {
-    ledger.costBasis = round2(Math.max(0, ledger.costBasis - amount))
-  }
   ledger.flows.push({
     t: now,
     kind: 'out',
     amount: round2(amount),
     source: 'withdraw',
   })
+  // Prefer pro-rata only when total known; else full amount off principal.
+  if (total > 0 && sumFlows(ledger.flows.filter((f) => f !== ledger.flows[ledger.flows.length - 1]!)) > 0) {
+    // already pushed; recompute from flows after adjusting last out to pro-rata
+    const prior = sumFlows(ledger.flows.slice(0, -1))
+    const ratio = Math.min(1, amount / total)
+    const basisOut = prior * ratio
+    ledger.flows[ledger.flows.length - 1]!.amount = round2(basisOut)
+  }
+  ledger.costBasis = round2(sumFlows(ledger.flows))
   if (ledger.flows.length > MAX_FLOWS) {
     ledger.flows = ledger.flows.slice(-MAX_FLOWS)
   }
@@ -295,7 +317,15 @@ export function statsFor(
           ]
         : []
 
-  const costBasis = ledger?.costBasis ?? (currentTotal > 0 ? currentTotal : 0)
+  // Always derive principal from flows when present (fixes stale costBasis).
+  let costBasis =
+    ledger && ledger.flows.length > 0
+      ? sumFlows(ledger.flows)
+      : (ledger?.costBasis ?? (currentTotal > 0 ? currentTotal : 0))
+  costBasis = round2(Math.max(0, costBasis))
+  // If ledger is empty but we have a live balance, treat as principal until
+  // the first deposit is recorded (avoids fake 100% P&L on first view).
+  if (costBasis <= 0 && currentTotal > 0) costBasis = round2(currentTotal)
   const pnl = currentTotal - costBasis
   const pnlPct = costBasis > 0 ? (pnl / costBasis) * 100 : 0
 
