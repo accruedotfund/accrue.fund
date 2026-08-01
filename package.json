@@ -26,6 +26,7 @@
     "@capacitor/browser": "^6.0.0",
     "@capacitor/core": "^6.0.0",
     "@coinbase/cdp-sdk": "^1.53.0",
+    "@crossmint/client-sdk-react-ui": "^4.3.4",
     "@privy-io/node": "^0.26.0",
     "@privy-io/react-auth": "^3.33.1",
     "react": "^18.3.1",

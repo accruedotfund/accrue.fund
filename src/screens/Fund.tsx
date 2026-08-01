@@ -21,14 +21,18 @@ import {
   formatMoney,
   type CurrencyCode,
 } from '../lib/rails'
+import CrossmintCheckout, {
+  crossmintClientReady,
+} from '../components/CrossmintCheckout'
 
 // Settlement is always Relay both ways (no chain words in UI):
-//   IN  card/bank/etc → Base USDC → Relay deposit addr → RH dollar balance
+//   IN  card/bank (Crossmint) → Base USDC → Relay deposit addr → RH dollar balance
 //   OUT free cash on RH → Relay → Base USDC → optional bank hop
+// Crypto send / alt onramps are a hidden advanced path.
 
 type Direction = 'in' | 'out'
-/** How the user funds the Base USDC deposit leg. */
-type PayMethod = 'card' | 'coinbase' | 'moonpay' | 'choose'
+/** Primary = Crossmint. Advanced = crypto / alt partners (hidden by default). */
+type PayMethod = 'crossmint' | 'coinbase' | 'moonpay' | 'choose' | 'crypto'
 /** Deposit feedback after the payment UI closes. */
 type DepositOutcome =
   | null
@@ -37,17 +41,23 @@ type DepositOutcome =
   | { phase: 'failed'; message: string }
   | { phase: 'timeout'; message: string }
 
+type CrossmintSession = {
+  orderId: string
+  clientSecret: string
+  receiptEmail: string
+}
+
 const PRESETS = [50, 200, 1000]
 
-const PAY_METHODS: {
-  id: PayMethod
+const ADVANCED_PAY: {
+  id: Exclude<PayMethod, 'crossmint'>
   label: string
   blurb: string
 }[] = [
   {
-    id: 'card',
-    label: 'Card or bank',
-    blurb: 'Debit, credit, or bank — no Coinbase account needed.',
+    id: 'crypto',
+    label: 'Send USDC (crypto)',
+    blurb: 'Transfer Base USDC from a wallet you already have.',
   },
   {
     id: 'coinbase',
@@ -61,8 +71,8 @@ const PAY_METHODS: {
   },
   {
     id: 'choose',
-    label: 'Show all options',
-    blurb: 'Open the full payment menu and pick there.',
+    label: 'All payment options',
+    blurb: 'Open the full wallet funding menu.',
   },
 ]
 
@@ -110,8 +120,10 @@ export default function Fund({
   const [depositRoute, setDepositRoute] = useState<RelayDepositRoute | null>(
     null,
   )
-  const [payMethod, setPayMethod] = useState<PayMethod>('card')
+  const [payMethod, setPayMethod] = useState<PayMethod>('crossmint')
+  const [showAdvancedPay, setShowAdvancedPay] = useState(false)
   const [depositOutcome, setDepositOutcome] = useState<DepositOutcome>(null)
+  const [crossmint, setCrossmint] = useState<CrossmintSession | null>(null)
   /** Withdraw settled to Base (Relay reverse). */
   const [withdrawSettled, setWithdrawSettled] = useState(false)
   const settleAbort = useRef<AbortController | null>(null)
@@ -157,51 +169,121 @@ export default function Fund({
     setWithdrawSettled(false)
     setAmount('')
     setDepositRoute(null)
+    setCrossmint(null)
     setStatus(null)
     setError(null)
+    setShowAdvancedPay(false)
+    setPayMethod('crossmint')
+  }
+
+  /** Open Crossmint embedded checkout → Base USDC at Relay deposit address. */
+  async function openCrossmintOnramp(route: RelayDepositRoute) {
+    const receiptEmail = (email || '').trim()
+    if (!receiptEmail || !receiptEmail.includes('@')) {
+      throw new Error(
+        'Add an email to your account first — card/bank needs a receipt address.',
+      )
+    }
+    if (!crossmintClientReady()) {
+      throw new Error('Card/bank checkout is not configured yet.')
+    }
+    const origin =
+      API_BASE ||
+      (typeof window !== 'undefined' ? window.location.origin : '')
+    const accessToken = await getAccessToken()
+    const res = await fetch(`${origin}/api/crossmint-order`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+      },
+      body: JSON.stringify({
+        walletAddress: route.depositAddress,
+        amount: value,
+        receiptEmail,
+        kind: 'onramp',
+      }),
+    })
+    const body = (await res.json().catch(() => ({}))) as {
+      orderId?: string
+      clientSecret?: string
+      message?: string
+      error?: string
+    }
+    if (!res.ok || !body.orderId || !body.clientSecret) {
+      throw new Error(
+        body.message ||
+          body.error ||
+          'Could not start card/bank checkout. Try again.',
+      )
+    }
+    setCrossmint({
+      orderId: body.orderId,
+      clientSecret: body.clientSecret,
+      receiptEmail,
+    })
   }
 
   /** Pay Base USDC into the Relay deposit address (Base → Relay → RH dollars). */
   async function openDepositPayment(route: RelayDepositRoute) {
-    if (payMethod === 'card') {
-      // Fiat onramp destinations the Relay sink — not a personal QR receive.
-      await fundFiat({
-        source: {
-          assets: ['usd', 'eur', 'gbp'],
-          defaultAsset: sourceCurrency.toLowerCase() as 'usd' | 'eur' | 'gbp',
+    if (payMethod === 'crossmint') {
+      await openCrossmintOnramp(route)
+      return
+    }
+    // Advanced: crypto transfer / Coinbase / MoonPay / full menu (Privy).
+    if (payMethod === 'crypto' || payMethod === 'choose') {
+      await fundWallet({
+        address: route.depositAddress,
+        options: {
+          chain: base,
+          amount: String(value),
+          asset: 'USDC' as const,
+          ...(payMethod === 'choose'
+            ? {}
+            : { defaultFundingMethod: 'wallet' as const }),
         },
-        destination: {
-          address: route.depositAddress,
-          chain: 'eip155:8453',
-          asset: RELAY_ORIGIN_ASSET,
-        },
-        environment: import.meta.env.PROD ? 'production' : 'sandbox',
-        defaultAmount: String(value),
       })
       return
     }
-    const baseOpts = {
-      chain: base,
-      amount: String(value),
-      asset: 'USDC' as const,
+    if (payMethod === 'coinbase') {
+      await fundWallet({
+        address: route.depositAddress,
+        options: {
+          chain: base,
+          amount: String(value),
+          asset: 'USDC' as const,
+          defaultFundingMethod: 'exchange' as const,
+          card: { preferredProvider: 'coinbase' as const },
+        },
+      })
+      return
     }
-    const options =
-      payMethod === 'coinbase'
-        ? {
-            ...baseOpts,
-            defaultFundingMethod: 'exchange' as const,
-            card: { preferredProvider: 'coinbase' as const },
-          }
-        : payMethod === 'moonpay'
-          ? {
-              ...baseOpts,
-              defaultFundingMethod: 'card' as const,
-              card: { preferredProvider: 'moonpay' as const },
-            }
-          : baseOpts
-    await fundWallet({
-      address: route.depositAddress,
-      options,
+    if (payMethod === 'moonpay') {
+      await fundWallet({
+        address: route.depositAddress,
+        options: {
+          chain: base,
+          amount: String(value),
+          asset: 'USDC' as const,
+          defaultFundingMethod: 'card' as const,
+          card: { preferredProvider: 'moonpay' as const },
+        },
+      })
+      return
+    }
+    // Fallback Privy fiat onramp
+    await fundFiat({
+      source: {
+        assets: ['usd', 'eur', 'gbp'],
+        defaultAsset: sourceCurrency.toLowerCase() as 'usd' | 'eur' | 'gbp',
+      },
+      destination: {
+        address: route.depositAddress,
+        chain: 'eip155:8453',
+        asset: RELAY_ORIGIN_ASSET,
+      },
+      environment: import.meta.env.PROD ? 'production' : 'sandbox',
+      defaultAmount: String(value),
     })
   }
 
@@ -308,10 +390,15 @@ export default function Fund({
         setStatus('Opening secure payment…')
         // Pay → Base USDC at Relay deposit address → Relay → RH USDG.
         await openDepositPayment(depositRoute)
-        setDone(true)
+        // Crossmint stays embedded; other methods close and we wait on settlement.
+        if (payMethod !== 'crossmint') {
+          setDone(true)
+          void watchDepositSettlement(depositRoute)
+        } else {
+          void watchDepositSettlement(depositRoute)
+        }
         setBusy(false)
         setStatus(null)
-        void watchDepositSettlement(depositRoute)
         return
       }
 
@@ -361,6 +448,52 @@ export default function Fund({
       setBusy(false)
       setStatus(null)
     }
+  }
+
+  // Embedded Crossmint checkout (primary path)
+  if (crossmint && depositRoute && direction === 'in') {
+    return (
+      <div className="screen">
+        <header>
+          <h1>Add money</h1>
+          <p className="small muted">
+            Card or bank · estimate{' '}
+            {formatMoney(currency, Number(depositRoute.quotedReceived))}
+          </p>
+        </header>
+        <CrossmintCheckout
+          orderId={crossmint.orderId}
+          clientSecret={crossmint.clientSecret}
+          receiptEmail={crossmint.receiptEmail}
+          onClose={() => {
+            setCrossmint(null)
+            setBusy(false)
+          }}
+        />
+        {depositOutcome?.phase === 'waiting' && (
+          <p className="small muted" style={{ marginTop: 12 }} aria-live="polite">
+            {depositOutcome.message}
+          </p>
+        )}
+        {depositOutcome?.phase === 'settled' && (
+          <div className="notice" style={{ marginTop: 12 }}>
+            <p style={{ margin: 0, fontWeight: 600 }}>
+              Money arrived · +{depositOutcome.receivedLabel}
+            </p>
+            <button
+              className="btn btn-primary"
+              style={{ marginTop: 10 }}
+              onClick={() => {
+                clearDepositFlow()
+                if (onRefresh) void onRefresh()
+              }}
+            >
+              Back to account
+            </button>
+          </div>
+        )}
+      </div>
+    )
   }
 
   if (done && direction === 'in') {
@@ -590,33 +723,72 @@ export default function Fund({
           </div>
 
           <div className="field">
-            <label id="pay-how">How do you want to pay?</label>
+            <label id="pay-how">Payment</label>
             <div
               className="presets pay-options"
               role="radiogroup"
               aria-labelledby="pay-how"
             >
-              {PAY_METHODS.map((m) => (
-                <button
-                  key={m.id}
-                  type="button"
-                  role="radio"
-                  aria-checked={payMethod === m.id}
-                  aria-pressed={payMethod === m.id}
-                  onClick={() => setPayMethod(m.id)}
-                >
-                  <span className="figure" style={{ fontSize: '1rem' }}>
-                    {m.label}
-                    {m.id === 'card' ? ' · recommended' : ''}
-                  </span>
-                  <span className="small muted">{m.blurb}</span>
-                </button>
-              ))}
+              <button
+                type="button"
+                role="radio"
+                aria-checked={payMethod === 'crossmint'}
+                aria-pressed={payMethod === 'crossmint'}
+                onClick={() => {
+                  setPayMethod('crossmint')
+                  setShowAdvancedPay(false)
+                }}
+              >
+                <span className="figure" style={{ fontSize: '1rem' }}>
+                  Card or bank · recommended
+                </span>
+                <span className="small muted">
+                  Debit, credit, or bank — lands in your dollar account
+                  automatically.
+                </span>
+              </button>
             </div>
-            <p className="small muted" style={{ marginTop: 8 }}>
-              Coinbase is optional. Card or bank does not require a Coinbase
-              account.
-            </p>
+
+            <button
+              type="button"
+              className="btn btn-quiet"
+              style={{
+                width: 'auto',
+                marginTop: 10,
+                padding: '6px 0',
+                fontSize: '0.85rem',
+              }}
+              onClick={() => setShowAdvancedPay((v) => !v)}
+            >
+              {showAdvancedPay
+                ? 'Hide crypto / other options'
+                : 'Advanced · crypto send or other wallets'}
+            </button>
+
+            {showAdvancedPay && (
+              <div
+                className="presets pay-options"
+                role="radiogroup"
+                aria-label="Advanced payment"
+                style={{ marginTop: 8 }}
+              >
+                {ADVANCED_PAY.map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={payMethod === m.id}
+                    aria-pressed={payMethod === m.id}
+                    onClick={() => setPayMethod(m.id)}
+                  >
+                    <span className="figure" style={{ fontSize: '1rem' }}>
+                      {m.label}
+                    </span>
+                    <span className="small muted">{m.blurb}</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </>
       )}
@@ -642,20 +814,22 @@ export default function Fund({
           ? status || 'One moment…'
           : direction === 'in'
             ? depositRoute
-              ? payMethod === 'coinbase'
-                ? 'Continue with Coinbase'
-                : payMethod === 'moonpay'
-                  ? 'Continue with MoonPay'
-                  : payMethod === 'choose'
-                    ? 'Open payment options'
-                    : 'Continue with card or bank'
+              ? payMethod === 'crossmint'
+                ? 'Continue with card or bank'
+                : payMethod === 'crypto'
+                  ? 'Continue with crypto transfer'
+                  : payMethod === 'coinbase'
+                    ? 'Continue with Coinbase'
+                    : payMethod === 'moonpay'
+                      ? 'Continue with MoonPay'
+                      : 'Open payment options'
               : 'Review deposit'
             : 'Cash out'}
       </button>
 
       <p className="small muted">
         {direction === 'in'
-          ? 'Card/bank pays on Base; we route it into your dollar account automatically.'
+          ? 'Card or bank is the default. Crypto transfer is under Advanced if you already hold USDC.'
           : 'Cash out frees your balance, settles it to cash, then opens bank payout when configured. Needs a tiny Robinhood network fee (ETH).'}
       </p>
     </div>

@@ -897,3 +897,17 @@ p {
 .stat-v .small {
   font-weight: 500;
 }
+
+/* Crossmint embedded checkout */
+.crossmint-shell {
+  width: 100%;
+  max-width: 480px;
+  margin: 0 auto;
+}
+.crossmint-frame {
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  min-height: 420px;
+}
