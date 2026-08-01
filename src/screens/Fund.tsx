@@ -1,13 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { Browser } from '@capacitor/browser'
-import { useFiatOnramp, useFundWallet } from '@privy-io/react-auth'
+import { useFundWallet } from '@privy-io/react-auth'
 import { base } from 'viem/chains'
 import { formatUnits } from 'viem'
 import { useAuth } from '../lib/auth'
 import {
   prepareRelayDepositRoute,
   waitForDepositSettlement,
-  RELAY_ORIGIN_ASSET,
   type RelayDepositRoute,
 } from '../lib/relay'
 import { windDownViaRelay } from '../lib/withdraw'
@@ -26,13 +25,18 @@ import CrossmintCheckout, {
 } from '../components/CrossmintCheckout'
 
 // Settlement is always Relay both ways (no chain words in UI):
-//   IN  card/bank (Crossmint) → Base USDC → Relay deposit addr → RH dollar balance
+//   IN  Transak card/bank (or crypto send) → Base USDC → Relay → RH dollars
 //   OUT free cash on RH → Relay → Base USDC → optional bank hop
-// Crypto send / alt onramps are a hidden advanced path.
+// Privy Stripe/MoonPay are NOT used — they fail for CA / Stripe init.
 
 type Direction = 'in' | 'out'
-/** Primary = Crossmint. Advanced = crypto / alt partners (hidden by default). */
-type PayMethod = 'crossmint' | 'coinbase' | 'moonpay' | 'choose' | 'crypto'
+/**
+ * transak = merchant widget (primary fiat)
+ * crypto  = copy Base USDC address (always works)
+ * coinbase = Privy exchange only (optional)
+ * crossmint = optional when project verified
+ */
+type PayMethod = 'transak' | 'crypto' | 'coinbase' | 'crossmint'
 /** Deposit feedback after the payment UI closes. */
 type DepositOutcome =
   | null
@@ -49,30 +53,33 @@ type CrossmintSession = {
 
 const PRESETS = [50, 200, 1000]
 
-const ADVANCED_PAY: {
-  id: Exclude<PayMethod, 'crossmint'>
+const PAY_OPTIONS: {
+  id: PayMethod
   label: string
   blurb: string
+  badge?: string
 }[] = [
+  {
+    id: 'transak',
+    label: 'Card or bank',
+    blurb: 'Buy Base USDC with card/bank — then it routes into your dollar account.',
+    badge: 'recommended',
+  },
   {
     id: 'crypto',
     label: 'Send USDC (crypto)',
-    blurb: 'Transfer Base USDC from a wallet you already have.',
+    blurb: 'Copy the deposit address and send Base USDC from Coinbase or any wallet.',
+    badge: 'works now',
   },
   {
     id: 'coinbase',
-    label: 'Coinbase',
-    blurb: 'If you already use Coinbase (account or onramp).',
+    label: 'Coinbase exchange',
+    blurb: 'If you already hold funds on Coinbase (exchange funding).',
   },
   {
-    id: 'moonpay',
-    label: 'MoonPay',
-    blurb: 'Another card partner. May not be available in every region.',
-  },
-  {
-    id: 'choose',
-    label: 'All payment options',
-    blurb: 'Open the full wallet funding menu.',
+    id: 'crossmint',
+    label: 'Crossmint (card)',
+    blurb: 'Alternate card partner — needs project verification to work in production.',
   },
 ]
 
@@ -81,8 +88,11 @@ function humanError(err: unknown, direction: Direction): string {
   if (/minimum|too many decimals|valid amount|above zero|Not enough|available/i.test(msg)) {
     return msg
   }
-  if (/not configured|not ready|session has expired|Opening your dollar/i.test(msg)) {
+  if (/not configured|not ready|session has expired|Opening your dollar|Transak|transak/i.test(msg)) {
     return msg
+  }
+  if (/region|coming soon|not supported|geo/i.test(msg)) {
+    return 'That payment method is not available in your region. Use Send USDC (crypto) instead.'
   }
   if (/insufficient funds|gas required|intrinsic gas|network fee/i.test(msg)) {
     return direction === 'out'
@@ -95,7 +105,7 @@ function humanError(err: unknown, direction: Direction): string {
       : 'We couldn’t prepare a cash-out route right now. Your balance is untouched — try again.'
   }
   return direction === 'in'
-    ? 'We couldn’t start your deposit. Nothing was charged — try again.'
+    ? 'We couldn’t start your deposit. Nothing was charged — try again. Prefer Send USDC (crypto).'
     : 'We couldn’t start your cash out. Your balance is untouched — try again.'
 }
 
@@ -109,7 +119,6 @@ export default function Fund({
   const { email, address, getAccessToken, sendTransaction, walletReady } =
     useAuth()
   const { fundWallet } = useFundWallet()
-  const { fund: fundFiat } = useFiatOnramp()
   const [direction, setDirection] = useState<Direction>('in')
   const [currency, setCurrency] = useState<CurrencyCode>('USD')
   const [amount, setAmount] = useState('')
@@ -120,10 +129,10 @@ export default function Fund({
   const [depositRoute, setDepositRoute] = useState<RelayDepositRoute | null>(
     null,
   )
-  const [payMethod, setPayMethod] = useState<PayMethod>('crossmint')
-  const [showAdvancedPay, setShowAdvancedPay] = useState(false)
+  const [payMethod, setPayMethod] = useState<PayMethod>('transak')
   const [depositOutcome, setDepositOutcome] = useState<DepositOutcome>(null)
   const [crossmint, setCrossmint] = useState<CrossmintSession | null>(null)
+  const [copied, setCopied] = useState(false)
   /** Withdraw settled to Base (Relay reverse). */
   const [withdrawSettled, setWithdrawSettled] = useState(false)
   const settleAbort = useRef<AbortController | null>(null)
@@ -172,11 +181,46 @@ export default function Fund({
     setCrossmint(null)
     setStatus(null)
     setError(null)
-    setShowAdvancedPay(false)
-    setPayMethod('crossmint')
+    setCopied(false)
+    setPayMethod('transak')
   }
 
-  /** Open Crossmint embedded checkout → Base USDC at Relay deposit address. */
+  function apiOrigin(): string {
+    return (
+      API_BASE ||
+      (typeof window !== 'undefined' ? window.location.origin : '')
+    )
+  }
+
+  /** Transak merchant widget → Base USDC at Relay deposit address. */
+  async function openTransakOnramp(route: RelayDepositRoute) {
+    const res = await fetch(`${apiOrigin()}/api/transak-widget`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        walletAddress: route.depositAddress,
+        amount: value,
+        email: email || undefined,
+        productsAvailed: 'BUY',
+        fiatCurrency: 'USD',
+      }),
+    })
+    const body = (await res.json().catch(() => ({}))) as {
+      widgetUrl?: string
+      message?: string
+      error?: string
+    }
+    if (!res.ok || !body.widgetUrl) {
+      throw new Error(
+        body.message ||
+          body.error ||
+          'Card/bank (Transak) is not available yet. Use Send USDC (crypto).',
+      )
+    }
+    await Browser.open({ url: body.widgetUrl })
+  }
+
+  /** Crossmint embedded checkout (optional / when verified). */
   async function openCrossmintOnramp(route: RelayDepositRoute) {
     const receiptEmail = (email || '').trim()
     if (!receiptEmail || !receiptEmail.includes('@')) {
@@ -185,13 +229,12 @@ export default function Fund({
       )
     }
     if (!crossmintClientReady()) {
-      throw new Error('Card/bank checkout is not configured yet.')
+      throw new Error(
+        'Crossmint is not configured. Use Transak or Send USDC (crypto).',
+      )
     }
-    const origin =
-      API_BASE ||
-      (typeof window !== 'undefined' ? window.location.origin : '')
     const accessToken = await getAccessToken()
-    const res = await fetch(`${origin}/api/crossmint-order`, {
+    const res = await fetch(`${apiOrigin()}/api/crossmint-order`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -214,7 +257,7 @@ export default function Fund({
       throw new Error(
         body.message ||
           body.error ||
-          'Could not start card/bank checkout. Try again.',
+          'Crossmint is not live yet (project verification). Use Transak or crypto send.',
       )
     }
     setCrossmint({
@@ -224,25 +267,31 @@ export default function Fund({
     })
   }
 
-  /** Pay Base USDC into the Relay deposit address (Base → Relay → RH dollars). */
+  async function copyDepositAddress(addr: string) {
+    try {
+      await navigator.clipboard.writeText(addr)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      setError('Could not copy — select the address and copy manually.')
+    }
+  }
+
+  /**
+   * Pay Base USDC into the Relay deposit address.
+   * No Privy fundFiat / MoonPay card — those crash or geo-block.
+   */
   async function openDepositPayment(route: RelayDepositRoute) {
-    if (payMethod === 'crossmint') {
-      await openCrossmintOnramp(route)
+    if (payMethod === 'transak') {
+      await openTransakOnramp(route)
       return
     }
-    // Advanced: crypto transfer / Coinbase / MoonPay / full menu (Privy).
-    if (payMethod === 'crypto' || payMethod === 'choose') {
-      await fundWallet({
-        address: route.depositAddress,
-        options: {
-          chain: base,
-          amount: String(value),
-          asset: 'USDC' as const,
-          ...(payMethod === 'choose'
-            ? {}
-            : { defaultFundingMethod: 'wallet' as const }),
-        },
-      })
+    if (payMethod === 'crypto') {
+      // Stay on-page with copyable address (no Privy modal).
+      return
+    }
+    if (payMethod === 'crossmint') {
+      await openCrossmintOnramp(route)
       return
     }
     if (payMethod === 'coinbase') {
@@ -253,38 +302,10 @@ export default function Fund({
           amount: String(value),
           asset: 'USDC' as const,
           defaultFundingMethod: 'exchange' as const,
-          card: { preferredProvider: 'coinbase' as const },
         },
       })
       return
     }
-    if (payMethod === 'moonpay') {
-      await fundWallet({
-        address: route.depositAddress,
-        options: {
-          chain: base,
-          amount: String(value),
-          asset: 'USDC' as const,
-          defaultFundingMethod: 'card' as const,
-          card: { preferredProvider: 'moonpay' as const },
-        },
-      })
-      return
-    }
-    // Fallback Privy fiat onramp
-    await fundFiat({
-      source: {
-        assets: ['usd', 'eur', 'gbp'],
-        defaultAsset: sourceCurrency.toLowerCase() as 'usd' | 'eur' | 'gbp',
-      },
-      destination: {
-        address: route.depositAddress,
-        chain: 'eip155:8453',
-        asset: RELAY_ORIGIN_ASSET,
-      },
-      environment: import.meta.env.PROD ? 'production' : 'sandbox',
-      defaultAmount: String(value),
-    })
   }
 
   async function watchDepositSettlement(route: RelayDepositRoute) {
@@ -385,18 +406,34 @@ export default function Fund({
           })
           setDepositRoute(route)
           setStatus(null)
+          // Crypto: stay on page with address; start watching immediately.
+          if (payMethod === 'crypto') {
+            void watchDepositSettlement(route)
+          }
           return
         }
-        setStatus('Opening secure payment…')
-        // Pay → Base USDC at Relay deposit address → Relay → RH USDG.
+        setStatus(
+          payMethod === 'crypto'
+            ? 'Showing deposit address…'
+            : 'Opening secure payment…',
+        )
         await openDepositPayment(depositRoute)
-        // Crossmint stays embedded; other methods close and we wait on settlement.
-        if (payMethod !== 'crossmint') {
-          setDone(true)
+        // Crypto stays on this screen (address panel). Others open external/embed.
+        if (payMethod === 'crypto') {
+          setBusy(false)
+          setStatus(null)
           void watchDepositSettlement(depositRoute)
-        } else {
-          void watchDepositSettlement(depositRoute)
+          return
         }
+        if (payMethod === 'crossmint') {
+          void watchDepositSettlement(depositRoute)
+          setBusy(false)
+          setStatus(null)
+          return
+        }
+        // Transak / Coinbase: external UI; poll settlement in background
+        setDone(true)
+        void watchDepositSettlement(depositRoute)
         setBusy(false)
         setStatus(null)
         return
@@ -723,73 +760,86 @@ export default function Fund({
           </div>
 
           <div className="field">
-            <label id="pay-how">Payment</label>
+            <label id="pay-how">How to pay</label>
             <div
               className="presets pay-options"
               role="radiogroup"
               aria-labelledby="pay-how"
             >
-              <button
-                type="button"
-                role="radio"
-                aria-checked={payMethod === 'crossmint'}
-                aria-pressed={payMethod === 'crossmint'}
-                onClick={() => {
-                  setPayMethod('crossmint')
-                  setShowAdvancedPay(false)
+              {PAY_OPTIONS.map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={payMethod === m.id}
+                  aria-pressed={payMethod === m.id}
+                  onClick={() => setPayMethod(m.id)}
+                >
+                  <span className="figure" style={{ fontSize: '1rem' }}>
+                    {m.label}
+                    {m.badge ? ` · ${m.badge}` : ''}
+                  </span>
+                  <span className="small muted">{m.blurb}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {payMethod === 'crypto' && (
+            <div className="notice deposit-address" aria-live="polite">
+              <p style={{ margin: 0, fontWeight: 600 }}>
+                Send Base USDC to this address
+              </p>
+              <p className="small muted" style={{ margin: '6px 0 8px' }}>
+                Network must be <strong>Base</strong>. Wrong network = lost funds.
+                Amount ~{formatMoney('USD', value)}.
+              </p>
+              <code
+                className="figure"
+                style={{
+                  display: 'block',
+                  wordBreak: 'break-all',
+                  fontSize: '0.8rem',
+                  marginBottom: 10,
                 }}
               >
-                <span className="figure" style={{ fontSize: '1rem' }}>
-                  Card or bank · recommended
-                </span>
-                <span className="small muted">
-                  Debit, credit, or bank — lands in your dollar account
-                  automatically.
-                </span>
-              </button>
-            </div>
-
-            <button
-              type="button"
-              className="btn btn-quiet"
-              style={{
-                width: 'auto',
-                marginTop: 10,
-                padding: '6px 0',
-                fontSize: '0.85rem',
-              }}
-              onClick={() => setShowAdvancedPay((v) => !v)}
-            >
-              {showAdvancedPay
-                ? 'Hide crypto / other options'
-                : 'Advanced · crypto send or other wallets'}
-            </button>
-
-            {showAdvancedPay && (
-              <div
-                className="presets pay-options"
-                role="radiogroup"
-                aria-label="Advanced payment"
-                style={{ marginTop: 8 }}
-              >
-                {ADVANCED_PAY.map((m) => (
-                  <button
-                    key={m.id}
-                    type="button"
-                    role="radio"
-                    aria-checked={payMethod === m.id}
-                    aria-pressed={payMethod === m.id}
-                    onClick={() => setPayMethod(m.id)}
-                  >
-                    <span className="figure" style={{ fontSize: '1rem' }}>
-                      {m.label}
-                    </span>
-                    <span className="small muted">{m.blurb}</span>
-                  </button>
-                ))}
+                {depositRoute.depositAddress}
+              </code>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  style={{ width: 'auto', padding: '10px 18px' }}
+                  onClick={() =>
+                    void copyDepositAddress(depositRoute.depositAddress)
+                  }
+                >
+                  {copied ? 'Copied ✓' : 'Copy address'}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-quiet"
+                  style={{ width: 'auto', padding: '10px 18px' }}
+                  onClick={() => {
+                    void watchDepositSettlement(depositRoute)
+                    setStatus('Waiting for your transfer…')
+                  }}
+                >
+                  I’ve sent it
+                </button>
               </div>
-            )}
-          </div>
+              {depositOutcome?.phase === 'waiting' && (
+                <p className="small muted" style={{ marginTop: 10 }}>
+                  {depositOutcome.message}
+                </p>
+              )}
+              {depositOutcome?.phase === 'settled' && (
+                <p style={{ marginTop: 10, fontWeight: 600, color: 'var(--up)' }}>
+                  Money arrived · +{depositOutcome.receivedLabel}
+                </p>
+              )}
+            </div>
+          )}
         </>
       )}
 
@@ -805,31 +855,45 @@ export default function Fund({
         </div>
       )}
 
-      <button
-        className="btn btn-primary"
-        disabled={busy || !value || Boolean(invalid)}
-        onClick={go}
-      >
-        {busy
-          ? status || 'One moment…'
-          : direction === 'in'
-            ? depositRoute
-              ? payMethod === 'crossmint'
-                ? 'Continue with card or bank'
-                : payMethod === 'crypto'
-                  ? 'Continue with crypto transfer'
+      {!(direction === 'in' && depositRoute && payMethod === 'crypto') && (
+        <button
+          className="btn btn-primary"
+          disabled={busy || !value || Boolean(invalid)}
+          onClick={go}
+        >
+          {busy
+            ? status || 'One moment…'
+            : direction === 'in'
+              ? depositRoute
+                ? payMethod === 'transak'
+                  ? 'Continue with card or bank'
                   : payMethod === 'coinbase'
                     ? 'Continue with Coinbase'
-                    : payMethod === 'moonpay'
-                      ? 'Continue with MoonPay'
-                      : 'Open payment options'
-              : 'Review deposit'
-            : 'Cash out'}
-      </button>
+                    : payMethod === 'crossmint'
+                      ? 'Continue with Crossmint'
+                      : 'Continue'
+                : 'Review deposit'
+              : 'Cash out'}
+        </button>
+      )}
+
+      {direction === 'in' && depositRoute && payMethod === 'crypto' && (
+        <button
+          className="btn btn-quiet"
+          style={{ marginTop: 8 }}
+          disabled={busy}
+          onClick={() => {
+            clearDepositFlow()
+            if (onRefresh) void onRefresh()
+          }}
+        >
+          Done
+        </button>
+      )}
 
       <p className="small muted">
         {direction === 'in'
-          ? 'Card or bank is the default. Crypto transfer is under Advanced if you already hold USDC.'
+          ? 'Card/bank uses Transak (when configured). Crypto send always works: Base USDC only. MoonPay/Privy card are disabled — they fail in your region.'
           : 'Cash out frees your balance, settles it to cash, then opens bank payout when configured. Needs a tiny Robinhood network fee (ETH).'}
       </p>
     </div>
