@@ -194,6 +194,15 @@ export default function Fund({
 
   /** Transak merchant widget → Base USDC at Relay deposit address. */
   async function openTransakOnramp(route: RelayDepositRoute) {
+    // Prefer browser-reported public IP for x-user-ip (session pin)
+    let clientIp: string | undefined
+    try {
+      const ipRes = await fetch('https://api.ipify.org?format=json')
+      const ipJson = (await ipRes.json()) as { ip?: string }
+      if (ipJson.ip) clientIp = ipJson.ip
+    } catch {
+      /* server falls back to x-forwarded-for */
+    }
     const res = await fetch(`${apiOrigin()}/api/transak-widget`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -203,18 +212,26 @@ export default function Fund({
         email: email || undefined,
         productsAvailed: 'BUY',
         fiatCurrency: 'USD',
+        clientIp,
       }),
     })
     const body = (await res.json().catch(() => ({}))) as {
       widgetUrl?: string
       message?: string
       error?: string
+      hint?: string
+      mode?: string
     }
     if (!res.ok || !body.widgetUrl) {
       throw new Error(
         body.message ||
           body.error ||
           'Card/bank (Transak) is not available yet. Use Send USDC (crypto).',
+      )
+    }
+    if (body.hint && body.mode === 'legacy') {
+      setStatus(
+        'Opening Transak… (if it fails, use Send USDC — partner IP whitelist may still be pending)',
       )
     }
     await Browser.open({ url: body.widgetUrl })

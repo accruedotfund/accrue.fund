@@ -2,22 +2,24 @@
  * Create a Transak on-ramp widget session (merchant).
  * POST /api/transak-widget
  *
- * Docs:
- *   Staging:    https://api-gateway-stg.transak.com/api/v2/auth/session
- *   Production: https://api-gateway.transak.com/api/v2/auth/session
- * Headers: access-token, x-api-key, x-user-ip (required)
- * Body: { widgetParams: { apiKey, referrerDomain, ... } }
+ * Docs (Create Widget URL):
+ *   POST https://api-gateway.transak.com/api/v2/auth/session
+ *   Headers (all required):
+ *     access-token  — partner JWT from refresh-token
+ *     x-api-key     — partner API key
+ *     x-user-ip     — end-user IP (not server IP)
  *
- * Access token:
- *   Staging:    POST https://api-stg.transak.com/partners/api/v2/refresh-token
- *   Production: POST https://api.transak.com/partners/api/v2/refresh-token
- *   Headers: api-secret, content-type
+ * Docs (Refresh Access Token):
+ *   POST https://api.transak.com/partners/api/v2/refresh-token
+ *   Headers: api-secret, x-api-key, content-type
  *   Body: { apiKey }
  *
- * Server-only env:
- *   TRANSAK_API_KEY, TRANSAK_API_SECRET
- *   TRANSAK_ENV = production | staging
- *   TRANSAK_REFERRER_DOMAIN = accrue.fund
+ * IMPORTANT: Transak must whitelist this backend's static egress IPs.
+ * Vercel serverless has dynamic IPs — if session returns 401, either:
+ *   1) Add fixed egress / submit Transak partner security checklist, or
+ *   2) Client falls back to hosted widget with public apiKey (if dashboard allows).
+ *
+ * Env (server only): TRANSAK_API_KEY, TRANSAK_API_SECRET, TRANSAK_ENV, TRANSAK_REFERRER_DOMAIN
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node'
@@ -29,7 +31,7 @@ function isStaging(): boolean {
   const env = (process.env.TRANSAK_ENV || '').toLowerCase()
   if (env === 'staging' || env === 'stg') return true
   if (env === 'production' || env === 'prod') return false
-  return /stg|staging|test/i.test(API_KEY)
+  return false
 }
 
 function refreshTokenUrl(): string {
@@ -44,6 +46,12 @@ function sessionUrl(): string {
     : 'https://api-gateway.transak.com/api/v2/auth/session'
 }
 
+function widgetHost(): string {
+  return isStaging()
+    ? 'https://global-stg.transak.com'
+    : 'https://global.transak.com'
+}
+
 let cachedToken: { token: string; exp: number } | null = null
 
 async function partnerAccessToken(): Promise<string> {
@@ -56,6 +64,7 @@ async function partnerAccessToken(): Promise<string> {
       accept: 'application/json',
       'content-type': 'application/json',
       'api-secret': API_SECRET,
+      'x-api-key': API_KEY,
     },
     body: JSON.stringify({ apiKey: API_KEY }),
   })
@@ -79,25 +88,53 @@ async function partnerAccessToken(): Promise<string> {
 }
 
 function clientIp(req: VercelRequest, bodyIp?: string): string {
-  if (bodyIp && /^\d{1,3}(\.\d{1,3}){3}$/.test(bodyIp.trim())) {
-    return bodyIp.trim()
+  if (bodyIp) {
+    const t = bodyIp.trim()
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(t)) return t
+    if (t.includes(':')) return t // ipv6
   }
-  const xf = String(req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || '')
-  const first = xf.split(',')[0]?.trim()
-  if (first && first !== '::1' && first !== '127.0.0.1') {
-    // Prefer IPv4 if present
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(first)) return first
-    // Strip IPv6 mapped :ffff:x.x.x.x
-    const m = first.match(/(\d{1,3}(?:\.\d{1,3}){3})$/)
+  const h = req.headers
+  const candidates = [
+    h['cf-connecting-ip'],
+    h['x-real-ip'],
+    String(h['x-forwarded-for'] || '').split(',')[0],
+    h['x-vercel-forwarded-for'],
+  ]
+  for (const c of candidates) {
+    const v = String(c || '').trim()
+    if (!v || v === '::1' || v === '127.0.0.1') continue
+    const m = v.match(/(\d{1,3}(?:\.\d{1,3}){3})/)
     if (m) return m[1]
-    return first
+    if (v.includes(':')) return v
   }
-  // Transak requires an end-user IP; TEST-NET-1 as last resort for local dev
   return '192.0.2.1'
 }
 
+function legacyWidgetUrl(
+  params: Record<string, string | number | boolean>,
+): string {
+  const q = new URLSearchParams()
+  for (const [k, v] of Object.entries(params)) {
+    q.set(k, String(v))
+  }
+  return `${widgetHost()}/?${q.toString()}`
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  res.setHeader('Access-Control-Allow-Origin', '*')
+  // CORS: only our domains (Transak security checklist)
+  const origin = String(req.headers.origin || '')
+  const allowed = [
+    'https://accrue.fund',
+    'https://www.accrue.fund',
+    'https://accruefund.vercel.app',
+    'http://localhost:5173',
+    'http://localhost:4173',
+    'http://127.0.0.1:5173',
+  ]
+  if (allowed.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
+  }
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
   res.setHeader(
     'Access-Control-Allow-Headers',
@@ -112,7 +149,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(503).json({
       error: 'transak_not_configured',
       message:
-        'Transak merchant keys missing. Use Send USDC (crypto), or set TRANSAK_API_KEY + TRANSAK_API_SECRET.',
+        'Transak keys missing. Use Send USDC (crypto) or set TRANSAK_API_KEY + TRANSAK_API_SECRET.',
     })
   }
 
@@ -176,32 +213,45 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const data = (await sess.json().catch(() => ({}))) as {
       data?: { widgetUrl?: string }
       message?: string
-      error?: { message?: string }
-      meta?: { message?: string }
+      error?: { message?: string; statusCode?: number; errorCode?: number }
     }
-    if (!sess.ok || !data.data?.widgetUrl) {
-      const msg =
-        data.message ||
-        data.error?.message ||
-        data.meta?.message ||
-        `Transak session failed (${sess.status})`
-      return res.status(sess.status >= 400 && sess.status < 600 ? sess.status : 502).json({
-        error: 'transak_session_failed',
-        message: msg,
-        // IP whitelist / partner setup hints for ops
-        hint:
-          sess.status === 401 || sess.status === 403
-            ? 'Check API key/secret, partner access token, and that Vercel egress IPs (or 0.0.0.0) are whitelisted in Transak dashboard.'
-            : undefined,
+
+    if (sess.ok && data.data?.widgetUrl) {
+      return res.status(200).json({
+        widgetUrl: data.data.widgetUrl,
+        env: isStaging() ? 'staging' : 'production',
+        mode: 'session',
       })
     }
+
+    // 401 often means partner IP not whitelisted for Create Widget URL
+    // Fall back to hosted widget URL (public apiKey) so onramp still opens.
+    const msg =
+      data.error?.message ||
+      data.message ||
+      `Transak session failed (${sess.status})`
+
+    const legacy = legacyWidgetUrl(widgetParams)
     return res.status(200).json({
-      widgetUrl: data.data.widgetUrl,
+      widgetUrl: legacy,
       env: isStaging() ? 'staging' : 'production',
-      mode: 'session',
+      mode: 'legacy',
+      warning: msg,
+      hint:
+        'If the widget fails to load: in Transak Partner Dashboard whitelist your backend egress IPs (Vercel) and set referrer domain to accrue.fund. Refresh-token works; Create Widget URL requires IP allowlist.',
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Transak error'
-    return res.status(502).json({ error: 'transak_error', message })
+    // Still try legacy open
+    try {
+      return res.status(200).json({
+        widgetUrl: legacyWidgetUrl(widgetParams),
+        env: isStaging() ? 'staging' : 'production',
+        mode: 'legacy',
+        warning: message,
+      })
+    } catch {
+      return res.status(502).json({ error: 'transak_error', message })
+    }
   }
 }
