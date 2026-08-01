@@ -25,18 +25,21 @@ import CrossmintCheckout, {
 } from '../components/CrossmintCheckout'
 
 // Settlement is always Relay both ways (no chain words in UI):
-//   IN  Transak card/bank (or crypto send) → Base USDC → Relay → RH dollars
+//   IN  Transak / MoonPay / crypto → Base USDC → Relay → RH dollars
 //   OUT free cash on RH → Relay → Base USDC → optional bank hop
-// Privy Stripe/MoonPay are NOT used — they fail for CA / Stripe init.
+// MoonPay via Privy is available for regions where MoonPay works (US/UK/EU…).
+// Geo-blocked users still have Transak + crypto. We do NOT use Privy Stripe
+// (crashes) — only MoonPay preferredProvider or wallet/exchange.
 
 type Direction = 'in' | 'out'
 /**
- * transak = merchant widget (primary fiat)
- * crypto  = copy Base USDC address (always works)
- * coinbase = Privy exchange only (optional)
+ * transak  = merchant widget (primary fiat when configured)
+ * moonpay  = Privy → MoonPay (works outside many blocked geos)
+ * crypto   = copy Base USDC address (always works)
+ * coinbase = Privy exchange
  * crossmint = optional when project verified
  */
-type PayMethod = 'transak' | 'crypto' | 'coinbase' | 'crossmint'
+type PayMethod = 'transak' | 'moonpay' | 'crypto' | 'coinbase' | 'crossmint'
 /** Deposit feedback after the payment UI closes. */
 type DepositOutcome =
   | null
@@ -61,15 +64,21 @@ const PAY_OPTIONS: {
 }[] = [
   {
     id: 'transak',
-    label: 'Card or bank',
+    label: 'Card or bank (Transak)',
     blurb: 'Buy Base USDC with card/bank — then it routes into your dollar account.',
     badge: 'recommended',
+  },
+  {
+    id: 'moonpay',
+    label: 'Card (MoonPay)',
+    blurb: 'Card / local rails in 160+ countries. May be unavailable in some regions.',
+    badge: 'global',
   },
   {
     id: 'crypto',
     label: 'Send USDC (crypto)',
     blurb: 'Copy the deposit address and send Base USDC from Coinbase or any wallet.',
-    badge: 'works now',
+    badge: 'always works',
   },
   {
     id: 'coinbase',
@@ -79,7 +88,7 @@ const PAY_OPTIONS: {
   {
     id: 'crossmint',
     label: 'Crossmint (card)',
-    blurb: 'Alternate card partner — needs project verification to work in production.',
+    blurb: 'Alternate card partner — needs project verification in production.',
   },
 ]
 
@@ -91,8 +100,8 @@ function humanError(err: unknown, direction: Direction): string {
   if (/not configured|not ready|session has expired|Opening your dollar|Transak|transak/i.test(msg)) {
     return msg
   }
-  if (/region|coming soon|not supported|geo/i.test(msg)) {
-    return 'That payment method is not available in your region. Use Send USDC (crypto) instead.'
+  if (/region|coming soon|not supported|geo|MoonPay/i.test(msg)) {
+    return 'That method is not available in your region. Try Transak, or Send USDC (crypto).'
   }
   if (/insufficient funds|gas required|intrinsic gas|network fee/i.test(msg)) {
     return direction === 'out'
@@ -296,7 +305,8 @@ export default function Fund({
 
   /**
    * Pay Base USDC into the Relay deposit address.
-   * No Privy fundFiat / MoonPay card — those crash or geo-block.
+   * MoonPay = Privy fundWallet with preferredProvider moonpay (region-dependent).
+   * Do NOT use fundFiat/Stripe — crashes with TypeError in this app setup.
    */
   async function openDepositPayment(route: RelayDepositRoute) {
     if (payMethod === 'transak') {
@@ -309,6 +319,33 @@ export default function Fund({
     }
     if (payMethod === 'crossmint') {
       await openCrossmintOnramp(route)
+      return
+    }
+    if (payMethod === 'moonpay') {
+      try {
+        await fundWallet({
+          address: route.depositAddress,
+          options: {
+            chain: base,
+            amount: String(value),
+            asset: 'USDC' as const,
+            defaultFundingMethod: 'card' as const,
+            card: { preferredProvider: 'moonpay' as const },
+          },
+        })
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e)
+        if (/region|coming soon|not supported|geo|unavailable/i.test(m)) {
+          throw new Error(
+            'MoonPay is not available in this region. Use Transak or Send USDC (crypto).',
+          )
+        }
+        // Privy sometimes throws empty errors after user closes geo-block modal
+        throw new Error(
+          m ||
+            'MoonPay could not start. Try Transak, or Send USDC (crypto) — works everywhere.',
+        )
+      }
       return
     }
     if (payMethod === 'coinbase') {
@@ -448,7 +485,7 @@ export default function Fund({
           setStatus(null)
           return
         }
-        // Transak / Coinbase: external UI; poll settlement in background
+        // Transak / MoonPay / Coinbase: external UI; poll settlement in background
         setDone(true)
         void watchDepositSettlement(depositRoute)
         setBusy(false)
@@ -883,12 +920,14 @@ export default function Fund({
             : direction === 'in'
               ? depositRoute
                 ? payMethod === 'transak'
-                  ? 'Continue with card or bank'
-                  : payMethod === 'coinbase'
-                    ? 'Continue with Coinbase'
-                    : payMethod === 'crossmint'
-                      ? 'Continue with Crossmint'
-                      : 'Continue'
+                  ? 'Continue with Transak'
+                  : payMethod === 'moonpay'
+                    ? 'Continue with MoonPay'
+                    : payMethod === 'coinbase'
+                      ? 'Continue with Coinbase'
+                      : payMethod === 'crossmint'
+                        ? 'Continue with Crossmint'
+                        : 'Continue'
                 : 'Review deposit'
               : 'Cash out'}
         </button>
@@ -910,7 +949,7 @@ export default function Fund({
 
       <p className="small muted">
         {direction === 'in'
-          ? 'Card/bank uses Transak (when configured). Crypto send always works: Base USDC only. MoonPay/Privy card are disabled — they fail in your region.'
+          ? 'MoonPay works in many countries (US/UK/EU+). If your region is blocked, use Transak or Send USDC on Base. Never use Ethereum mainnet.'
           : 'Cash out frees your balance, settles it to cash, then opens bank payout when configured. Needs a tiny Robinhood network fee (ETH).'}
       </p>
     </div>
