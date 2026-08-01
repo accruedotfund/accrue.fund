@@ -121,9 +121,9 @@ export const STRATEGIES: BoostStrategy[] = [
     id: 'growth',
     tier: 'growth',
     title: 'Growth',
-    subtitle: 'Higher risk · higher reward · can move with markets',
+    subtitle: 'Higher risk · higher reward · experimental · market-linked',
     riskCopy:
-      'Part of your balance is linked to market prices, not just dollars. It can fall well below what you put in — including large, fast drops. This is not your standard account.',
+      'Experimental. Part of your balance is linked to market prices, not just dollars. Principal can go down — sometimes a lot, sometimes fast. This is not your standard account.',
     riskLevel: 3,
   },
 ]

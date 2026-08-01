@@ -184,7 +184,7 @@ export default function Account({
               <span className="small muted" style={{ display: 'block' }}>
                 {b.tier === 'steady'
                   ? 'Dollar-linked · can still move a little'
-                  : 'Market-linked · can fall hard'}
+                  : 'Market-linked · experimental · can lose value'}
               </span>
             </span>
             <span className="figure">

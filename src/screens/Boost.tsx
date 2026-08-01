@@ -383,8 +383,8 @@ export default function Boost({
         <br />
         <strong>Steady</strong> stays dollar-linked but can still move a little.
         <br />
-        <strong>Growth</strong> can fall hard when markets move — higher upside,
-        higher risk.
+        <strong>Growth</strong> is experimental — market-linked, higher upside,
+        principal can drop when markets move.
       </div>
 
       {confirming && (

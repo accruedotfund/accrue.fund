@@ -2,6 +2,10 @@
 // Snapshots: balance over time for charts.
 // Flows: deposits / withdrawals for average cost basis and P&L.
 // All client-side — no backend. Survives reloads via localStorage.
+//
+// Rule: cost basis = capital in − capital out. Market/Boost MTM is P&L only.
+// Deposits book when balance jumps without a matching flow (Fund also calls
+// recordDeposit explicitly when settlement succeeds).
 
 export type BalancePoint = {
   t: number // ms epoch
@@ -16,6 +20,8 @@ export type Flow = {
   kind: 'in' | 'out'
   /** USD amount of principal moved */
   amount: number
+  /** optional source for UI */
+  source?: 'fund' | 'inferred' | 'seed' | 'withdraw'
 }
 
 export type Ledger = {
@@ -33,6 +39,10 @@ const MAX_FLOWS = 500
 const MIN_SNAP_GAP_MS = 60_000
 /** Always snap if balance moves more than this (USD). */
 const SNAP_EPS = 0.02
+/** Ignore dust when inferring deposits (Boost mark noise). */
+const INFER_MIN = 1
+/** Fund min deposit — jumps at/above this are capital until proven otherwise. */
+const DEPOSIT_SHAPE = 4.5
 
 function key(address: string) {
   return `accrue.history.v1.${address.toLowerCase()}`
@@ -71,8 +81,25 @@ function save(ledger: Ledger) {
   }
 }
 
+/** True if a recent flow already accounts for this amount (±15% or $0.50). */
+function flowCovers(
+  ledger: Ledger,
+  kind: 'in' | 'out',
+  amount: number,
+  withinMs: number,
+  now: number,
+): boolean {
+  return ledger.flows.some((f) => {
+    if (f.kind !== kind) return false
+    if (now - f.t > withinMs) return false
+    const tol = Math.max(0.5, amount * 0.15)
+    return Math.abs(f.amount - amount) <= tol
+  })
+}
+
 /**
  * Record a poll of account value. Throttled unless balance moved meaningfully.
+ * Large unexplained upticks → deposit (capital in), not free P&L.
  */
 export function recordSnapshot(
   address: string | undefined,
@@ -87,8 +114,7 @@ export function recordSnapshot(
   const ledger = loadLedger(address) ?? empty(address)
   const now = Date.now()
   const last = ledger.points[ledger.points.length - 1]
-  const moved =
-    !last || Math.abs(last.total - snap.total) >= SNAP_EPS
+  const moved = !last || Math.abs(last.total - snap.total) >= SNAP_EPS
   const aged = !last || now - last.t >= MIN_SNAP_GAP_MS
   if (!moved && !aged) return ledger
 
@@ -103,32 +129,48 @@ export function recordSnapshot(
     ledger.points = ledger.points.slice(-MAX_POINTS)
   }
 
-  // Infer cost basis from balance jumps when we have no explicit flows yet.
-  // Large upticks without a flow → treat as capital in (deposit / bridge).
-  if (last && snap.total > last.total + 0.5) {
-    const delta = snap.total - last.total
-    // Only auto-credit if no flow in last 2 minutes (Fund path may record explicitly)
-    const recentFlow = ledger.flows.some((f) => now - f.t < 120_000)
-    if (!recentFlow) {
-      ledger.costBasis = round2(ledger.costBasis + delta)
-      ledger.flows.push({ t: now, kind: 'in', amount: round2(delta) })
-    }
-  } else if (last && snap.total < last.total - 0.5 && ledger.costBasis > 0) {
-    const delta = last.total - snap.total
-    const recentFlow = ledger.flows.some((f) => now - f.t < 120_000)
-    if (!recentFlow) {
-      // Reduce cost basis pro-rata with withdrawal of value
-      const ratio = last.total > 0 ? Math.min(1, delta / last.total) : 1
-      const basisOut = ledger.costBasis * ratio
-      ledger.costBasis = round2(Math.max(0, ledger.costBasis - basisOut))
-      ledger.flows.push({ t: now, kind: 'out', amount: round2(delta) })
-    }
-  }
-
   // Seed cost basis on first non-zero snapshot
   if (ledger.points.length === 1 && snap.total > 0 && ledger.costBasis <= 0) {
     ledger.costBasis = round2(snap.total)
-    ledger.flows.push({ t: now, kind: 'in', amount: round2(snap.total) })
+    ledger.flows.push({
+      t: now,
+      kind: 'in',
+      amount: round2(snap.total),
+      source: 'seed',
+    })
+  } else if (last && snap.total > last.total + INFER_MIN) {
+    const delta = snap.total - last.total
+    // Deposit-shaped: ≥ ~min fund, or any jump when boost didn't dominate.
+    // Skip only if Fund already booked a matching flow.
+    const already = flowCovers(ledger, 'in', delta, 5 * 60_000, now)
+    const depositShaped = delta >= DEPOSIT_SHAPE
+    // Small bumps while boosted can be MTM — only book if deposit-shaped
+    // or available/standard legs drove the jump (proxy: boost delta small).
+    const boostDelta = snap.boost - (last.boost ?? 0)
+    const capitalLike = depositShaped || boostDelta < delta * 0.5
+    if (!already && capitalLike) {
+      ledger.costBasis = round2(ledger.costBasis + delta)
+      ledger.flows.push({
+        t: now,
+        kind: 'in',
+        amount: round2(delta),
+        source: 'inferred',
+      })
+    }
+  } else if (last && snap.total < last.total - INFER_MIN && ledger.costBasis > 0) {
+    const delta = last.total - snap.total
+    const already = flowCovers(ledger, 'out', delta, 5 * 60_000, now)
+    if (!already) {
+      const ratio = last.total > 0 ? Math.min(1, delta / last.total) : 1
+      const basisOut = ledger.costBasis * ratio
+      ledger.costBasis = round2(Math.max(0, ledger.costBasis - basisOut))
+      ledger.flows.push({
+        t: now,
+        kind: 'out',
+        amount: round2(delta),
+        source: 'inferred',
+      })
+    }
   }
 
   if (ledger.flows.length > MAX_FLOWS) {
@@ -140,12 +182,21 @@ export function recordSnapshot(
 }
 
 /** Explicit deposit (Fund success). Adds full amount to cost basis. */
-export function recordDeposit(address: string | undefined, amount: number) {
+export function recordDeposit(
+  address: string | undefined,
+  amount: number,
+  source: Flow['source'] = 'fund',
+) {
   if (!address || !(amount > 0)) return
   const ledger = loadLedger(address) ?? empty(address)
   const now = Date.now()
+  // Dedupe: Fund settle + poll may both fire for same dollars
+  if (flowCovers(ledger, 'in', amount, 5 * 60_000, now)) {
+    save(ledger)
+    return
+  }
   ledger.costBasis = round2(ledger.costBasis + amount)
-  ledger.flows.push({ t: now, kind: 'in', amount: round2(amount) })
+  ledger.flows.push({ t: now, kind: 'in', amount: round2(amount), source })
   if (ledger.flows.length > MAX_FLOWS) {
     ledger.flows = ledger.flows.slice(-MAX_FLOWS)
   }
@@ -161,6 +212,10 @@ export function recordWithdraw(
   if (!address || !(amount > 0)) return
   const ledger = loadLedger(address) ?? empty(address)
   const now = Date.now()
+  if (flowCovers(ledger, 'out', amount, 5 * 60_000, now)) {
+    save(ledger)
+    return
+  }
   const total =
     currentTotal ??
     ledger.points[ledger.points.length - 1]?.total ??
@@ -171,11 +226,26 @@ export function recordWithdraw(
   } else {
     ledger.costBasis = round2(Math.max(0, ledger.costBasis - amount))
   }
-  ledger.flows.push({ t: now, kind: 'out', amount: round2(amount) })
+  ledger.flows.push({
+    t: now,
+    kind: 'out',
+    amount: round2(amount),
+    source: 'withdraw',
+  })
   if (ledger.flows.length > MAX_FLOWS) {
     ledger.flows = ledger.flows.slice(-MAX_FLOWS)
   }
   save(ledger)
+}
+
+/** Recent capital flows for Home activity strip. */
+export function recentFlows(
+  address: string | undefined,
+  limit = 5,
+): Flow[] {
+  const ledger = loadLedger(address)
+  if (!ledger) return []
+  return [...ledger.flows].sort((a, b) => b.t - a.t).slice(0, limit)
 }
 
 export type HistoryStats = {
@@ -190,6 +260,7 @@ export type HistoryStats = {
   avgBalance: number
   points: BalancePoint[]
   hasHistory: boolean
+  recent: Flow[]
 }
 
 export function statsFor(
@@ -200,12 +271,28 @@ export function statsFor(
   const ledger = loadLedger(address)
   const now = Date.now()
   const points = (ledger?.points ?? []).filter((p) => p.t >= now - windowMs)
-  // Always append current as tip for live chart
   const series =
     points.length > 0
-      ? [...points, { t: now, total: currentTotal, available: 0, standard: 0, boost: 0 }]
+      ? [
+          ...points,
+          {
+            t: now,
+            total: currentTotal,
+            available: 0,
+            standard: 0,
+            boost: 0,
+          },
+        ]
       : currentTotal > 0
-        ? [{ t: now, total: currentTotal, available: 0, standard: 0, boost: 0 }]
+        ? [
+            {
+              t: now,
+              total: currentTotal,
+              available: 0,
+              standard: 0,
+              boost: 0,
+            },
+          ]
         : []
 
   const costBasis = ledger?.costBasis ?? (currentTotal > 0 ? currentTotal : 0)
@@ -230,6 +317,7 @@ export function statsFor(
     avgBalance: round2(avgBalance),
     points: series,
     hasHistory: (ledger?.points.length ?? 0) > 1,
+    recent: recentFlows(address, 5),
   }
 }
 

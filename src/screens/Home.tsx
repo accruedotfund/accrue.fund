@@ -1,11 +1,12 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import BalanceChart from '../components/BalanceChart'
 import { statsFor, type HistoryStats } from '../lib/history'
+import { fetchEcoStats, type EcoStats } from '../lib/eco'
 import type { Holding } from '../lib/nav'
 import { RAILS, formatMoney, type CurrencyCode } from '../lib/rails'
 import { useAuth } from '../lib/auth'
 
-// Monitor surface: total, chart (balance vs cost basis), ledger.
+// Monitor surface: total, chart (balance vs cost basis), activity, eco stats.
 
 type WindowKey = '1d' | '7d' | '30d' | 'all'
 
@@ -15,6 +16,14 @@ const WINDOWS: { id: WindowKey; label: string; ms: number }[] = [
   { id: '30d', label: '30D', ms: 30 * 24 * 60 * 60 * 1000 },
   { id: 'all', label: 'All', ms: 10 * 365 * 24 * 60 * 60 * 1000 },
 ]
+
+function ago(t: number): string {
+  const s = Math.max(0, Math.floor((Date.now() - t) / 1000))
+  if (s < 60) return `${s}s ago`
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`
+  return `${Math.floor(s / 86400)}d ago`
+}
 
 export default function Home({
   holdings,
@@ -31,6 +40,26 @@ export default function Home({
 }) {
   const { address } = useAuth()
   const [win, setWin] = useState<WindowKey>('7d')
+  const [eco, setEco] = useState<EcoStats | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const load = () => {
+      void fetchEcoStats()
+        .then((s) => {
+          if (!cancelled) setEco(s)
+        })
+        .catch(() => {
+          if (!cancelled) setEco(null)
+        })
+    }
+    load()
+    const t = setInterval(load, 60_000)
+    return () => {
+      cancelled = true
+      clearInterval(t)
+    }
+  }, [])
 
   const funded = useMemo(
     () => (holdings ?? []).filter((h) => h.balance > 0),
@@ -53,6 +82,7 @@ export default function Home({
 
   const pnlUp = stats.pnl >= 0
   const winUp = stats.windowChange >= 0
+  const deposits = stats.recent.filter((f) => f.kind === 'in')
 
   return (
     <div className="screen">
@@ -61,9 +91,7 @@ export default function Home({
         {holdings === null ? (
           <div className="skeleton" style={{ height: 48, width: '70%' }} />
         ) : (
-          <p className="display">
-            {formatMoney('USD', total)}
-          </p>
+          <p className="display">{formatMoney('USD', total)}</p>
         )}
         <p className="small muted">
           {funded.length || 'No'} funded account
@@ -152,11 +180,77 @@ export default function Home({
             </div>
           </div>
           <p className="small muted" style={{ marginTop: 8 }}>
-            Cost basis is average capital in (deposits minus cash-outs). Chart
-            builds as you use the app — stored on this device.
+            Cost basis is capital in (deposits) minus cash-outs. Deposits book
+            when money lands — not as fake yield.
           </p>
         </section>
       )}
+
+      {holdings !== null && deposits.length > 0 && (
+        <section aria-label="Recent deposits">
+          <h2 style={{ marginBottom: 8 }}>Activity</h2>
+          <div className="ledger">
+            {deposits.map((f, i) => (
+              <div
+                key={`${f.t}-${i}`}
+                className="row"
+                style={{ cursor: 'default' }}
+              >
+                <span className="grow">
+                  <span style={{ display: 'block', fontWeight: 600 }}>
+                    Deposit
+                  </span>
+                  <span className="small muted">{ago(f.t)}</span>
+                </span>
+                <span
+                  className="figure"
+                  style={{ fontSize: '1.05rem', color: 'var(--up)' }}
+                >
+                  +{formatMoney('USD', f.amount)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section className="chart-card" aria-label="Ecosystem">
+        <h2 style={{ marginBottom: 4 }}>Across Accrue</h2>
+        <p className="small muted" style={{ marginBottom: 12 }}>
+          Live totals for everyone using Accrue dollar rails — not just your
+          account.
+        </p>
+        {eco === null ? (
+          <div className="skeleton" style={{ height: 72, width: '100%' }} />
+        ) : (
+          <div className="stat-grid">
+            <div className="stat">
+              <div className="stat-k">Dollars in product</div>
+              <div className="stat-v figure">
+                {formatMoney('USD', eco.inProduct)}
+              </div>
+            </div>
+            <div className="stat">
+              <div className="stat-k">Standard vault</div>
+              <div className="stat-v figure">
+                {formatMoney('USD', eco.standardTvl)}
+              </div>
+            </div>
+            <div className="stat">
+              <div className="stat-k">Boost cash</div>
+              <div className="stat-v figure">
+                {formatMoney('USD', eco.boostCashTvl)}
+              </div>
+            </div>
+            <div className="stat">
+              <div className="stat-k">Dollar supply</div>
+              <div className="stat-v figure">
+                {formatMoney('USD', eco.dollarSupply)}
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
 
       <section>
         <h2 style={{ marginBottom: 8 }}>Accounts</h2>
@@ -206,8 +300,8 @@ export default function Home({
                           ? 'Open · add money to get started'
                           : h.boosted
                             ? h.boosts.some((b) => b.tier === 'growth')
-                              ? 'Growth Boost on · can fall hard'
-                              : 'Steady Boost on · can still move'
+                              ? 'Growth Boost on · experimental · principal can move'
+                              : 'Steady Boost on · dollar-linked · can still move'
                             : h.standardBalance > 0
                               ? `standard value per unit ${h.nav.toFixed(6)}`
                               : h.availableBalance > 0
@@ -243,8 +337,8 @@ export default function Home({
       </section>
 
       <p className="small muted">
-        Standard value per unit is designed to move upward. Growth is variable,
-        and Boosted balances can fall.
+        Standard value per unit is designed to move upward. Growth Boost is
+        experimental — boosted balances can go down.
       </p>
     </div>
   )

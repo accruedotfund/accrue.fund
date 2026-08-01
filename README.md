@@ -39,7 +39,7 @@ in the app? **dollar account. boost. move money.** done.
 | dollar account | USDG + vault on RH |
 | value / unit up | NAV-up wrapper (fees stay in the vault) |
 | steady boost | calmer dollar-linked LP |
-| growth boost | higher beta · can dump hard |
+| growth boost | higher beta · experimental · principal can drop |
 | add money | card/bank/coinbase/moonpay → base USDC → relay → USDG |
 | withdraw | USDG → relay → base USDC → bank partner when wired |
 
@@ -53,7 +53,7 @@ in the app? **dollar account. boost. move money.** done.
 |------|------|------|
 | **standard** | park it. value/unit designed only to climb | chill |
 | **steady boost** | dollar-linked, still working | medium |
-| **growth boost** | market-linked · can fall hard | degen |
+| **growth boost** | market-linked · experimental · principal can drop | optional risk |
 
 EUR / GBP / gold: **coming soon** when the rails exist. USD is live.
 
